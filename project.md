@@ -1,3 +1,27 @@
+/== common/config.dart
+class AppConfig {
+  // API Configuration
+  static const String apiKey = '2174d146bb9c0eab47529b2e77d6b526';
+  static const String baseUrl = 'https://api.themoviedb.org/3';
+  static const String baseImageUrl = 'https://image.tmdb.org/t/p/w500';
+  
+  // Endpoints
+  static String getNowPlayingMoviesUrl() => '$baseUrl/movie/now_playing?api_key=$apiKey';
+  static String getPopularMoviesUrl() => '$baseUrl/movie/popular?api_key=$apiKey';
+  static String getTopRatedMoviesUrl() => '$baseUrl/movie/top_rated?api_key=$apiKey';
+  static String getMovieDetailUrl(int id) => '$baseUrl/movie/$id?api_key=$apiKey';
+  static String getMovieRecommendationsUrl(int id) => '$baseUrl/movie/$id/recommendations?api_key=$apiKey';
+  static String searchMoviesUrl(String query) => '$baseUrl/search/movie?api_key=$apiKey&query=$query';
+  
+  // TV Series Endpoints
+  static String getNowPlayingTvSeriesUrl() => '$baseUrl/tv/on_the_air?api_key=$apiKey';
+  static String getPopularTvSeriesUrl() => '$baseUrl/tv/popular?api_key=$apiKey';
+  static String getTopRatedTvSeriesUrl() => '$baseUrl/tv/top_rated?api_key=$apiKey';
+  static String getTvSeriesDetailUrl(int id) => '$baseUrl/tv/$id?api_key=$apiKey';
+  static String getTvSeriesRecommendationsUrl(int id) => '$baseUrl/tv/$id/recommendations?api_key=$apiKey';
+  static String searchTvSeriesUrl(String query) => '$baseUrl/search/tv?api_key=$apiKey&query=$query';
+}
+
 /== common/constants.dart
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -82,6 +106,61 @@ class DatabaseFailure extends Failure {
   DatabaseFailure(String message) : super(message);
 }
 
+
+/== common/ssl_pinning.dart
+import 'dart:io';
+import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
+import 'package:flutter/foundation.dart';
+
+class HttpSSLPinning {
+  static Future<http.Client> get _instance async =>
+      _clientInstance ??= await createLEClient();
+
+  static http.Client? _clientInstance;
+  static http.Client get client => _clientInstance ?? http.Client();
+
+  static Future<void> init() async {
+    if (!kIsWeb) {
+      _clientInstance = await _instance;
+    }
+  }
+
+  static Future<http.Client> createLEClient() async {
+    final context = SecurityContext(withTrustedRoots: false);
+    
+    try {
+      // Untuk testing, kita skip loading certificate jika dalam test environment
+      if (!kIsWeb && !kTestMode) {
+        final bytes = (await rootBundle.load('assets/certificates/themoviedb.pem'))
+            .buffer
+            .asUint8List();
+        context.setTrustedCertificatesBytes(bytes);
+      }
+    } on TlsException catch (e) {
+      if (e.osError?.message != null &&
+          e.osError!.message.contains('CERT_ALREADY_IN_HASH_TABLE')) {
+        print('Certificate already trusted');
+      } else {
+        print('Error setting up certificate: ${e.message}');
+        rethrow;
+      }
+    } catch (e) {
+      print('Unexpected error setting up certificate: $e');
+      rethrow;
+    }
+
+    HttpClient httpClient = HttpClient(context: context);
+    httpClient.badCertificateCallback =
+        (X509Certificate cert, String host, int port) => false;
+    
+    return IOClient(httpClient);
+  }
+}
+
+// Flag untuk menunjukkan apakah kode berjalan dalam test environment
+bool kTestMode = false;
 
 /== common/state_enum.dart
 enum RequestState { Empty, Loading, Loaded, Error }
@@ -301,6 +380,7 @@ class MovieLocalDataSourceImpl implements MovieLocalDataSource {
 /== data/datasources/movie_remote_data_source.dart
 import 'dart:convert';
 
+import 'package:ditonton/common/config.dart';
 import 'package:ditonton/data/models/movie_detail_model.dart';
 import 'package:ditonton/data/models/movie_model.dart';
 import 'package:ditonton/data/models/movie_response.dart';
@@ -317,17 +397,13 @@ abstract class MovieRemoteDataSource {
 }
 
 class MovieRemoteDataSourceImpl implements MovieRemoteDataSource {
-  static const API_KEY = 'api_key=2174d146bb9c0eab47529b2e77d6b526';
-  static const BASE_URL = 'https://api.themoviedb.org/3';
-
   final http.Client client;
 
   MovieRemoteDataSourceImpl({required this.client});
 
   @override
   Future<List<MovieModel>> getNowPlayingMovies() async {
-    final response =
-        await client.get(Uri.parse('$BASE_URL/movie/now_playing?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getNowPlayingMoviesUrl()));
 
     if (response.statusCode == 200) {
       return MovieResponse.fromJson(json.decode(response.body)).movieList;
@@ -338,8 +414,7 @@ class MovieRemoteDataSourceImpl implements MovieRemoteDataSource {
 
   @override
   Future<MovieDetailResponse> getMovieDetail(int id) async {
-    final response =
-        await client.get(Uri.parse('$BASE_URL/movie/$id?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getMovieDetailUrl(id)));
 
     if (response.statusCode == 200) {
       return MovieDetailResponse.fromJson(json.decode(response.body));
@@ -350,8 +425,7 @@ class MovieRemoteDataSourceImpl implements MovieRemoteDataSource {
 
   @override
   Future<List<MovieModel>> getMovieRecommendations(int id) async {
-    final response = await client
-        .get(Uri.parse('$BASE_URL/movie/$id/recommendations?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getMovieRecommendationsUrl(id)));
 
     if (response.statusCode == 200) {
       return MovieResponse.fromJson(json.decode(response.body)).movieList;
@@ -362,8 +436,7 @@ class MovieRemoteDataSourceImpl implements MovieRemoteDataSource {
 
   @override
   Future<List<MovieModel>> getPopularMovies() async {
-    final response =
-        await client.get(Uri.parse('$BASE_URL/movie/popular?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getPopularMoviesUrl()));
 
     if (response.statusCode == 200) {
       return MovieResponse.fromJson(json.decode(response.body)).movieList;
@@ -374,8 +447,7 @@ class MovieRemoteDataSourceImpl implements MovieRemoteDataSource {
 
   @override
   Future<List<MovieModel>> getTopRatedMovies() async {
-    final response =
-        await client.get(Uri.parse('$BASE_URL/movie/top_rated?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getTopRatedMoviesUrl()));
 
     if (response.statusCode == 200) {
       return MovieResponse.fromJson(json.decode(response.body)).movieList;
@@ -386,8 +458,7 @@ class MovieRemoteDataSourceImpl implements MovieRemoteDataSource {
 
   @override
   Future<List<MovieModel>> searchMovies(String query) async {
-    final response = await client
-        .get(Uri.parse('$BASE_URL/search/movie?$API_KEY&query=$query'));
+    final response = await client.get(Uri.parse(AppConfig.searchMoviesUrl(query)));
 
     if (response.statusCode == 200) {
       return MovieResponse.fromJson(json.decode(response.body)).movieList;
@@ -396,7 +467,6 @@ class MovieRemoteDataSourceImpl implements MovieRemoteDataSource {
     }
   }
 }
-
 
 /== data/datasources/tv_series_local_data_source.dart
 import 'package:ditonton/common/exception.dart';
@@ -463,6 +533,7 @@ class TvSeriesLocalDataSourceImpl implements TvSeriesLocalDataSource {
 /== data/datasources/tv_series_remote_data_source.dart
 import 'dart:convert';
 
+import 'package:ditonton/common/config.dart';
 import 'package:ditonton/data/models/tv_series_detail_model.dart';
 import 'package:ditonton/data/models/tv_series_model.dart';
 import 'package:ditonton/data/models/tv_series_response.dart';
@@ -479,17 +550,13 @@ abstract class TvSeriesRemoteDataSource {
 }
 
 class TvSeriesRemoteDataSourceImpl implements TvSeriesRemoteDataSource {
-  static const API_KEY = 'api_key=2174d146bb9c0eab47529b2e77d6b526';
-  static const BASE_URL = 'https://api.themoviedb.org/3';
-
   final http.Client client;
 
   TvSeriesRemoteDataSourceImpl({required this.client});
 
   @override
   Future<List<TvSeriesModel>> getNowPlayingTvSeries() async {
-    final response =
-        await client.get(Uri.parse('$BASE_URL/tv/on_the_air?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getNowPlayingTvSeriesUrl()));
 
     if (response.statusCode == 200) {
       return TvSeriesResponse.fromJson(json.decode(response.body)).tvSeriesList;
@@ -500,7 +567,7 @@ class TvSeriesRemoteDataSourceImpl implements TvSeriesRemoteDataSource {
 
   @override
   Future<TvSeriesDetailResponse> getTvSeriesDetail(int id) async {
-    final response = await client.get(Uri.parse('$BASE_URL/tv/$id?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getTvSeriesDetailUrl(id)));
 
     if (response.statusCode == 200) {
       return TvSeriesDetailResponse.fromJson(json.decode(response.body));
@@ -511,8 +578,7 @@ class TvSeriesRemoteDataSourceImpl implements TvSeriesRemoteDataSource {
 
   @override
   Future<List<TvSeriesModel>> getTvSeriesRecommendations(int id) async {
-    final response = await client
-        .get(Uri.parse('$BASE_URL/tv/$id/recommendations?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getTvSeriesRecommendationsUrl(id)));
 
     if (response.statusCode == 200) {
       return TvSeriesResponse.fromJson(json.decode(response.body)).tvSeriesList;
@@ -523,8 +589,7 @@ class TvSeriesRemoteDataSourceImpl implements TvSeriesRemoteDataSource {
 
   @override
   Future<List<TvSeriesModel>> getPopularTvSeries() async {
-    final response =
-        await client.get(Uri.parse('$BASE_URL/tv/popular?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getPopularTvSeriesUrl()));
 
     if (response.statusCode == 200) {
       return TvSeriesResponse.fromJson(json.decode(response.body)).tvSeriesList;
@@ -535,8 +600,7 @@ class TvSeriesRemoteDataSourceImpl implements TvSeriesRemoteDataSource {
 
   @override
   Future<List<TvSeriesModel>> getTopRatedTvSeries() async {
-    final response =
-        await client.get(Uri.parse('$BASE_URL/tv/top_rated?$API_KEY'));
+    final response = await client.get(Uri.parse(AppConfig.getTopRatedTvSeriesUrl()));
 
     if (response.statusCode == 200) {
       return TvSeriesResponse.fromJson(json.decode(response.body)).tvSeriesList;
@@ -547,8 +611,7 @@ class TvSeriesRemoteDataSourceImpl implements TvSeriesRemoteDataSource {
 
   @override
   Future<List<TvSeriesModel>> searchTvSeries(String query) async {
-    final response = await client
-        .get(Uri.parse('$BASE_URL/search/tv?$API_KEY&query=$query'));
+    final response = await client.get(Uri.parse(AppConfig.searchTvSeriesUrl(query)));
 
     if (response.statusCode == 200) {
       return TvSeriesResponse.fromJson(json.decode(response.body)).tvSeriesList;
@@ -557,7 +620,6 @@ class TvSeriesRemoteDataSourceImpl implements TvSeriesRemoteDataSource {
     }
   }
 }
-
 
 /== data/models/genre_model.dart
 import 'package:ditonton/domain/entities/genre.dart';
@@ -2254,6 +2316,7 @@ class DefaultFirebaseOptions {
 
 
 /== injection.dart
+import 'package:ditonton/common/ssl_pinning.dart';
 import 'package:ditonton/data/datasources/db/database_helper.dart';
 import 'package:ditonton/data/datasources/movie_local_data_source.dart';
 import 'package:ditonton/data/datasources/movie_remote_data_source.dart';
@@ -2297,6 +2360,7 @@ import 'package:ditonton/domain/usecases/remove_watchlist_tv_series.dart';
 import 'package:ditonton/domain/usecases/save_watchlist_tv_series.dart';
 import 'package:http/http.dart' as http;
 import 'package:get_it/get_it.dart';
+import 'package:flutter/foundation.dart';
 
 final locator = GetIt.instance;
 
@@ -2429,12 +2493,19 @@ void init() {
   locator.registerLazySingleton<DatabaseHelper>(() => DatabaseHelper());
 
   // external
-  locator.registerLazySingleton(() => http.Client());
+  // Conditional HTTP client berdasarkan environment
+  if (kTestMode) {
+    // Gunakan standard HTTP client untuk testing
+    locator.registerLazySingleton<http.Client>(() => http.Client());
+  } else {
+    // Gunakan SSL pinned client untuk production
+    locator.registerLazySingleton<http.Client>(() => HttpSSLPinning.client);
+  }
 }
-
 
 /== main.dart
 import 'package:ditonton/common/constants.dart';
+import 'package:ditonton/common/ssl_pinning.dart';
 import 'package:ditonton/common/utils.dart';
 import 'package:ditonton/firebase_options.dart';
 import 'package:ditonton/presentation/pages/about_page.dart';
@@ -2471,10 +2542,14 @@ import 'package:ditonton/injection.dart' as di;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  di.init();
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
+  
+  // Initialize SSL Pinning
+  await HttpSSLPinning.init();
+  
+  di.init();
   runApp(MyApp());
 }
 
@@ -2583,7 +2658,6 @@ class MyApp extends StatelessWidget {
     );
   }
 }
-
 
 /== presentation/pages/about_page.dart
 import 'package:ditonton/common/constants.dart';
