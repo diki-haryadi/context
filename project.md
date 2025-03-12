@@ -107,6 +107,39 @@ class DatabaseFailure extends Failure {
 }
 
 
+/== common/network_info.dart
+import 'dart:io';
+
+abstract class NetworkInfo {
+  Future<bool> get isConnected;
+}
+
+class NetworkInfoImpl implements NetworkInfo {
+  final String lookupAddress;
+  
+  NetworkInfoImpl({this.lookupAddress = 'google.com'});
+  
+  @override
+  Future<bool> get isConnected async {
+    try {
+      // Lookup DNS to check internet connection
+      final result = await InternetAddress.lookup(lookupAddress);
+      
+      if (result.isNotEmpty && result[0].rawAddress.isNotEmpty) {
+        return true;
+      }
+      return false;
+    } on SocketException catch (_) {
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+// Add this to injection.dart
+// locator.registerLazySingleton<NetworkInfo>(() => NetworkInfoImpl());
+
 /== common/ssl_pinning.dart
 import 'dart:io';
 import 'package:flutter/services.dart';
@@ -115,28 +148,35 @@ import 'package:http/io_client.dart';
 import 'package:flutter/foundation.dart';
 
 class HttpSSLPinning {
-  static Future<http.Client> get _instance async =>
-      _clientInstance ??= await createLEClient();
-
   static http.Client? _clientInstance;
   static http.Client get client => _clientInstance ?? http.Client();
 
   static Future<void> init() async {
-    if (!kIsWeb) {
-      _clientInstance = await _instance;
+    if (kIsWeb) {
+      _clientInstance = http.Client();
+      return;
     }
+    
+    _clientInstance = await _setupSecureClient();
   }
 
-  static Future<http.Client> createLEClient() async {
+  static Future<http.Client> _setupSecureClient() async {
     final context = SecurityContext(withTrustedRoots: false);
     
     try {
       // Untuk testing, kita skip loading certificate jika dalam test environment
-      if (!kIsWeb && !kTestMode) {
-        final bytes = (await rootBundle.load('assets/certificates/themoviedb.pem'))
-            .buffer
-            .asUint8List();
-        context.setTrustedCertificatesBytes(bytes);
+      if (!kTestMode) {
+        try {
+          final bytes = (await rootBundle.load('certificates/themoviedb.org.pem'))
+              .buffer
+              .asUint8List();
+          context.setTrustedCertificatesBytes(bytes);
+          print('Certificate setup successfully');
+        } catch (e) {
+          print('Error loading certificate: $e');
+          // Jika gagal loading certificate, gunakan context default
+          return http.Client();
+        }
       }
     } on TlsException catch (e) {
       if (e.osError?.message != null &&
@@ -144,18 +184,65 @@ class HttpSSLPinning {
         print('Certificate already trusted');
       } else {
         print('Error setting up certificate: ${e.message}');
-        rethrow;
+        // Fallback to regular client if certificate fails
+        return http.Client();
       }
     } catch (e) {
       print('Unexpected error setting up certificate: $e');
-      rethrow;
+      // Fallback to regular client
+      return http.Client();
     }
 
     HttpClient httpClient = HttpClient(context: context);
+    
+    // Set timeout
+    httpClient.connectionTimeout = const Duration(seconds: 15);
+    
+    // Handle bad certificate
     httpClient.badCertificateCallback =
-        (X509Certificate cert, String host, int port) => false;
+        (X509Certificate cert, String host, int port) {
+          print('Bad certificate check for $host:$port');
+          return false;
+        };
     
     return IOClient(httpClient);
+  }
+  
+  // Method untuk melakukan retry jika koneksi gagal
+  static Future<http.Response> get(
+    String url, {
+    Map<String, String>? headers,
+    int maxRetries = 3,
+  }) async {
+    int retries = 0;
+    
+    while (retries < maxRetries) {
+      try {
+        final response = await client.get(
+          Uri.parse(url),
+          headers: headers,
+        );
+        
+        if (response.statusCode == 200) {
+          return response;
+        }
+        
+        retries++;
+        await Future.delayed(Duration(seconds: 1));
+      } catch (e) {
+        print('Error in HTTP GET ($retries): $e');
+        retries++;
+        
+        if (retries >= maxRetries) {
+          rethrow;
+        }
+        
+        await Future.delayed(Duration(seconds: 1));
+      }
+    }
+    
+    // Jika masih tidak berhasil setelah retry, throw exception
+    throw SocketException('Failed to connect after $maxRetries retries');
   }
 }
 
@@ -379,8 +466,10 @@ class MovieLocalDataSourceImpl implements MovieLocalDataSource {
 
 /== data/datasources/movie_remote_data_source.dart
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:ditonton/common/config.dart';
+import 'package:ditonton/common/ssl_pinning.dart';
 import 'package:ditonton/data/models/movie_detail_model.dart';
 import 'package:ditonton/data/models/movie_model.dart';
 import 'package:ditonton/data/models/movie_response.dart';
@@ -403,69 +492,152 @@ class MovieRemoteDataSourceImpl implements MovieRemoteDataSource {
 
   @override
   Future<List<MovieModel>> getNowPlayingMovies() async {
-    final response = await client.get(Uri.parse(AppConfig.getNowPlayingMoviesUrl()));
+    try {
+      final url = AppConfig.getNowPlayingMoviesUrl();
+      
+      // Menggunakan custom get method dengan retry
+      final response = await _getWithRetry(url);
 
-    if (response.statusCode == 200) {
-      return MovieResponse.fromJson(json.decode(response.body)).movieList;
-    } else {
+      if (response.statusCode == 200) {
+        return MovieResponse.fromJson(json.decode(response.body)).movieList;
+      } else {
+        throw ServerException();
+      }
+    } on SocketException {
+      throw ConnectionFailureException('Failed to connect to the network');
+    } on http.ClientException {
+      throw ConnectionFailureException('Failed to connect to the server');
+    } catch (e) {
       throw ServerException();
     }
   }
 
   @override
   Future<MovieDetailResponse> getMovieDetail(int id) async {
-    final response = await client.get(Uri.parse(AppConfig.getMovieDetailUrl(id)));
+    try {
+      final url = AppConfig.getMovieDetailUrl(id);
+      final response = await _getWithRetry(url);
 
-    if (response.statusCode == 200) {
-      return MovieDetailResponse.fromJson(json.decode(response.body));
-    } else {
+      if (response.statusCode == 200) {
+        return MovieDetailResponse.fromJson(json.decode(response.body));
+      } else {
+        throw ServerException();
+      }
+    } on SocketException {
+      throw ConnectionFailureException('Failed to connect to the network');
+    } on http.ClientException {
+      throw ConnectionFailureException('Failed to connect to the server');
+    } catch (e) {
       throw ServerException();
     }
   }
 
   @override
   Future<List<MovieModel>> getMovieRecommendations(int id) async {
-    final response = await client.get(Uri.parse(AppConfig.getMovieRecommendationsUrl(id)));
+    try {
+      final url = AppConfig.getMovieRecommendationsUrl(id);
+      final response = await _getWithRetry(url);
 
-    if (response.statusCode == 200) {
-      return MovieResponse.fromJson(json.decode(response.body)).movieList;
-    } else {
+      if (response.statusCode == 200) {
+        return MovieResponse.fromJson(json.decode(response.body)).movieList;
+      } else {
+        throw ServerException();
+      }
+    } on SocketException {
+      throw ConnectionFailureException('Failed to connect to the network');
+    } on http.ClientException {
+      throw ConnectionFailureException('Failed to connect to the server');
+    } catch (e) {
       throw ServerException();
     }
   }
 
   @override
   Future<List<MovieModel>> getPopularMovies() async {
-    final response = await client.get(Uri.parse(AppConfig.getPopularMoviesUrl()));
+    try {
+      final url = AppConfig.getPopularMoviesUrl();
+      final response = await _getWithRetry(url);
 
-    if (response.statusCode == 200) {
-      return MovieResponse.fromJson(json.decode(response.body)).movieList;
-    } else {
+      if (response.statusCode == 200) {
+        return MovieResponse.fromJson(json.decode(response.body)).movieList;
+      } else {
+        throw ServerException();
+      }
+    } on SocketException {
+      throw ConnectionFailureException('Failed to connect to the network');
+    } on http.ClientException {
+      throw ConnectionFailureException('Failed to connect to the server'); 
+    } catch (e) {
       throw ServerException();
     }
   }
 
   @override
   Future<List<MovieModel>> getTopRatedMovies() async {
-    final response = await client.get(Uri.parse(AppConfig.getTopRatedMoviesUrl()));
+    try {
+      final url = AppConfig.getTopRatedMoviesUrl();
+      final response = await _getWithRetry(url);
 
-    if (response.statusCode == 200) {
-      return MovieResponse.fromJson(json.decode(response.body)).movieList;
-    } else {
+      if (response.statusCode == 200) {
+        return MovieResponse.fromJson(json.decode(response.body)).movieList;
+      } else {
+        throw ServerException();
+      }
+    } on SocketException {
+      throw ConnectionFailureException('Failed to connect to the network');
+    } on http.ClientException {
+      throw ConnectionFailureException('Failed to connect to the server');
+    } catch (e) {
       throw ServerException();
     }
   }
 
   @override
   Future<List<MovieModel>> searchMovies(String query) async {
-    final response = await client.get(Uri.parse(AppConfig.searchMoviesUrl(query)));
+    try {
+      final url = AppConfig.searchMoviesUrl(query);
+      final response = await _getWithRetry(url);
 
-    if (response.statusCode == 200) {
-      return MovieResponse.fromJson(json.decode(response.body)).movieList;
-    } else {
+      if (response.statusCode == 200) {
+        return MovieResponse.fromJson(json.decode(response.body)).movieList;
+      } else {
+        throw ServerException();
+      }
+    } on SocketException {
+      throw ConnectionFailureException('Failed to connect to the network');
+    } on http.ClientException {
+      throw ConnectionFailureException('Failed to connect to the server');
+    } catch (e) {
       throw ServerException();
     }
   }
+  
+  // Custom get method with retry logic
+  Future<http.Response> _getWithRetry(String url, {int maxRetries = 3}) async {
+    int retries = 0;
+    
+    while (retries < maxRetries) {
+      try {
+        final response = await client.get(Uri.parse(url));
+        return response;
+      } catch (e) {
+        retries++;
+        if (retries >= maxRetries) {
+          rethrow;
+        }
+        await Future.delayed(Duration(seconds: 1));
+      }
+    }
+    
+    throw SocketException('Failed to connect after $maxRetries retries');
+  }
+}
+
+// Custom exception for better error handling
+class ConnectionFailureException implements Exception {
+  final String message;
+  
+  ConnectionFailureException(this.message);
 }
 
 /== data/datasources/tv_series_local_data_source.dart
@@ -1343,6 +1515,7 @@ import 'package:ditonton/domain/entities/movie_detail.dart';
 import 'package:ditonton/domain/repositories/movie_repository.dart';
 import 'package:ditonton/common/exception.dart';
 import 'package:ditonton/common/failure.dart';
+import 'package:http/http.dart' as http;
 
 class MovieRepositoryImpl implements MovieRepository {
   final MovieRemoteDataSource remoteDataSource;
@@ -1359,9 +1532,15 @@ class MovieRepositoryImpl implements MovieRepository {
       final result = await remoteDataSource.getNowPlayingMovies();
       return Right(result.map((model) => model.toEntity()).toList());
     } on ServerException {
-      return Left(ServerFailure(''));
+      return Left(ServerFailure('Server error occurred'));
     } on SocketException {
       return Left(ConnectionFailure('Failed to connect to the network'));
+    } on http.ClientException {
+      return Left(ConnectionFailure('Network connection problem'));
+    } on ConnectionFailureException catch (e) {
+      return Left(ConnectionFailure(e.message));
+    } catch (e) {
+      return Left(ConnectionFailure('Unexpected error: ${e.toString()}'));
     }
   }
 
@@ -1371,9 +1550,15 @@ class MovieRepositoryImpl implements MovieRepository {
       final result = await remoteDataSource.getMovieDetail(id);
       return Right(result.toEntity());
     } on ServerException {
-      return Left(ServerFailure(''));
+      return Left(ServerFailure('Server error occurred'));
     } on SocketException {
       return Left(ConnectionFailure('Failed to connect to the network'));
+    } on http.ClientException {
+      return Left(ConnectionFailure('Network connection problem'));
+    } on ConnectionFailureException catch (e) {
+      return Left(ConnectionFailure(e.message));
+    } catch (e) {
+      return Left(ConnectionFailure('Unexpected error: ${e.toString()}'));
     }
   }
 
@@ -1383,9 +1568,15 @@ class MovieRepositoryImpl implements MovieRepository {
       final result = await remoteDataSource.getMovieRecommendations(id);
       return Right(result.map((model) => model.toEntity()).toList());
     } on ServerException {
-      return Left(ServerFailure(''));
+      return Left(ServerFailure('Server error occurred'));
     } on SocketException {
       return Left(ConnectionFailure('Failed to connect to the network'));
+    } on http.ClientException {
+      return Left(ConnectionFailure('Network connection problem'));
+    } on ConnectionFailureException catch (e) {
+      return Left(ConnectionFailure(e.message));
+    } catch (e) {
+      return Left(ConnectionFailure('Unexpected error: ${e.toString()}'));
     }
   }
 
@@ -1395,9 +1586,15 @@ class MovieRepositoryImpl implements MovieRepository {
       final result = await remoteDataSource.getPopularMovies();
       return Right(result.map((model) => model.toEntity()).toList());
     } on ServerException {
-      return Left(ServerFailure(''));
+      return Left(ServerFailure('Server error occurred'));
     } on SocketException {
       return Left(ConnectionFailure('Failed to connect to the network'));
+    } on http.ClientException {
+      return Left(ConnectionFailure('Network connection problem'));
+    } on ConnectionFailureException catch (e) {
+      return Left(ConnectionFailure(e.message));
+    } catch (e) {
+      return Left(ConnectionFailure('Unexpected error: ${e.toString()}'));
     }
   }
 
@@ -1407,9 +1604,15 @@ class MovieRepositoryImpl implements MovieRepository {
       final result = await remoteDataSource.getTopRatedMovies();
       return Right(result.map((model) => model.toEntity()).toList());
     } on ServerException {
-      return Left(ServerFailure(''));
+      return Left(ServerFailure('Server error occurred'));
     } on SocketException {
       return Left(ConnectionFailure('Failed to connect to the network'));
+    } on http.ClientException {
+      return Left(ConnectionFailure('Network connection problem'));
+    } on ConnectionFailureException catch (e) {
+      return Left(ConnectionFailure(e.message));
+    } catch (e) {
+      return Left(ConnectionFailure('Unexpected error: ${e.toString()}'));
     }
   }
 
@@ -1419,9 +1622,15 @@ class MovieRepositoryImpl implements MovieRepository {
       final result = await remoteDataSource.searchMovies(query);
       return Right(result.map((model) => model.toEntity()).toList());
     } on ServerException {
-      return Left(ServerFailure(''));
+      return Left(ServerFailure('Server error occurred'));
     } on SocketException {
       return Left(ConnectionFailure('Failed to connect to the network'));
+    } on http.ClientException {
+      return Left(ConnectionFailure('Network connection problem'));
+    } on ConnectionFailureException catch (e) {
+      return Left(ConnectionFailure(e.message));
+    } catch (e) {
+      return Left(ConnectionFailure('Unexpected error: ${e.toString()}'));
     }
   }
 
@@ -1434,7 +1643,7 @@ class MovieRepositoryImpl implements MovieRepository {
     } on DatabaseException catch (e) {
       return Left(DatabaseFailure(e.message));
     } catch (e) {
-      throw e;
+      return Left(DatabaseFailure(e.toString()));
     }
   }
 
@@ -1446,6 +1655,8 @@ class MovieRepositoryImpl implements MovieRepository {
       return Right(result);
     } on DatabaseException catch (e) {
       return Left(DatabaseFailure(e.message));
+    } catch (e) {
+      return Left(DatabaseFailure(e.toString()));
     }
   }
 
@@ -1457,11 +1668,16 @@ class MovieRepositoryImpl implements MovieRepository {
 
   @override
   Future<Either<Failure, List<Movie>>> getWatchlistMovies() async {
-    final result = await localDataSource.getWatchlistMovies();
-    return Right(result.map((data) => data.toEntity()).toList());
+    try {
+      final result = await localDataSource.getWatchlistMovies();
+      return Right(result.map((data) => data.toEntity()).toList());
+    } on DatabaseException catch (e) {
+      return Left(DatabaseFailure(e.message));
+    } catch (e) {
+      return Left(DatabaseFailure(e.toString()));
+    }
   }
 }
-
 
 /== data/repositories/tv_series_repository_impl.dart
 import 'dart:io';
@@ -2316,6 +2532,7 @@ class DefaultFirebaseOptions {
 
 
 /== injection.dart
+import 'package:ditonton/common/network_info.dart';
 import 'package:ditonton/common/ssl_pinning.dart';
 import 'package:ditonton/data/datasources/db/database_helper.dart';
 import 'package:ditonton/data/datasources/movie_local_data_source.dart';
@@ -2333,18 +2550,6 @@ import 'package:ditonton/domain/usecases/remove_watchlist.dart';
 import 'package:ditonton/domain/usecases/save_watchlist.dart';
 import 'package:ditonton/domain/usecases/search_movies.dart';
 import 'package:ditonton/domain/usecases/search_tv_series.dart';
-import 'package:ditonton/presentation/provider/movie_detail_notifier.dart';
-import 'package:ditonton/presentation/provider/movie_list_notifier.dart';
-import 'package:ditonton/presentation/provider/movie_search_notifier.dart';
-import 'package:ditonton/presentation/provider/popular_movies_notifier.dart';
-import 'package:ditonton/presentation/provider/top_rated_movies_notifier.dart';
-import 'package:ditonton/presentation/provider/tv_series_search_notifier.dart';
-import 'package:ditonton/presentation/provider/watchlist_movie_notifier.dart';
-import 'package:ditonton/presentation/provider/tv_series_list_notifier.dart';
-import 'package:ditonton/presentation/provider/tv_series_detail_notifier.dart';
-import 'package:ditonton/presentation/provider/popular_tv_series_notifier.dart';
-import 'package:ditonton/presentation/provider/top_rated_tv_series_notifier.dart';
-import 'package:ditonton/presentation/provider/watchlist_tv_series_notifier.dart';
 import 'package:ditonton/data/datasources/tv_series_local_data_source.dart';
 import 'package:ditonton/data/datasources/tv_series_remote_data_source.dart';
 import 'package:ditonton/data/repositories/tv_series_repository_impl.dart';
@@ -2362,19 +2567,29 @@ import 'package:http/http.dart' as http;
 import 'package:get_it/get_it.dart';
 import 'package:flutter/foundation.dart';
 
+// Import BLoC files
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/movie_detail/movie_detail_bloc.dart';
+import 'package:ditonton/presentation/bloc/movie_search/movie_search_bloc.dart';
+import 'package:ditonton/presentation/bloc/watchlist_movie/watchlist_movie_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_detail/tv_series_detail_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_search/tv_series_search_bloc.dart';
+import 'package:ditonton/presentation/bloc/watchlist_tv_series/watchlist_tv_series_bloc.dart';
+
 final locator = GetIt.instance;
 
 void init() {
-  // provider
+  // BLoC
   locator.registerFactory(
-    () => MovieListNotifier(
+    () => MovieListBloc(
       getNowPlayingMovies: locator(),
       getPopularMovies: locator(),
       getTopRatedMovies: locator(),
     ),
   );
   locator.registerFactory(
-    () => MovieDetailNotifier(
+    () => MovieDetailBloc(
       getMovieDetail: locator(),
       getMovieRecommendations: locator(),
       getWatchListStatus: locator(),
@@ -2383,36 +2598,26 @@ void init() {
     ),
   );
   locator.registerFactory(
-    () => MovieSearchNotifier(
+    () => MovieSearchBloc(
       searchMovies: locator(),
     ),
   );
   locator.registerFactory(
-    () => PopularMoviesNotifier(
-      locator(),
-    ),
-  );
-  locator.registerFactory(
-    () => TopRatedMoviesNotifier(
-      getTopRatedMovies: locator(),
-    ),
-  );
-  locator.registerFactory(
-    () => WatchlistMovieNotifier(
+    () => WatchlistMovieBloc(
       getWatchlistMovies: locator(),
     ),
   );
 
-  // tv series provider
+  // tv series BLoC
   locator.registerFactory(
-    () => TvSeriesListNotifier(
+    () => TvSeriesListBloc(
       getNowPlayingTvSeries: locator(),
       getPopularTvSeries: locator(),
       getTopRatedTvSeries: locator(),
     ),
   );
   locator.registerFactory(
-    () => TvSeriesDetailNotifier(
+    () => TvSeriesDetailBloc(
       getTvSeriesDetail: locator(),
       getTvSeriesRecommendations: locator(),
       getWatchListStatus: locator(),
@@ -2421,23 +2626,13 @@ void init() {
     ),
   );
   locator.registerFactory(
-    () => PopularTvSeriesNotifier(
-      getPopularTvSeries: locator(),
-    ),
-  );
-  locator.registerFactory(
-    () => TopRatedTvSeriesNotifier(
-      getTopRatedTvSeries: locator(),
-    ),
-  );
-  locator.registerFactory(
-    () => WatchlistTvSeriesNotifier(
-      getWatchlistTvSeries: locator(),
-    ),
-  );
-  locator.registerFactory(
-    () => TvSeriesSearchNotifier(
+    () => TvSeriesSearchBloc(
       searchTvSeries: locator(),
+    ),
+  );
+  locator.registerFactory(
+    () => WatchlistTvSeriesBloc(
+      getWatchlistTvSeries: locator(),
     ),
   );
 
@@ -2493,14 +2688,15 @@ void init() {
   locator.registerLazySingleton<DatabaseHelper>(() => DatabaseHelper());
 
   // external
-  // Conditional HTTP client berdasarkan environment
+  // Conditional HTTP client based on environment
   if (kTestMode) {
-    // Gunakan standard HTTP client untuk testing
+    // Use standard HTTP client for testing
     locator.registerLazySingleton<http.Client>(() => http.Client());
   } else {
-    // Gunakan SSL pinned client untuk production
+    // Use SSL pinned client for production
     locator.registerLazySingleton<http.Client>(() => HttpSSLPinning.client);
   }
+  locator.registerLazySingleton<NetworkInfo>(() => NetworkInfoImpl());
 }
 
 /== main.dart
@@ -2522,77 +2718,82 @@ import 'package:ditonton/presentation/pages/tv_series_detail_page.dart';
 import 'package:ditonton/presentation/pages/watchlist_movies_page.dart';
 import 'package:ditonton/presentation/pages/home_tv_series_page.dart';
 import 'package:ditonton/presentation/pages/watchlist_tv_series_page.dart';
-import 'package:ditonton/presentation/provider/movie_detail_notifier.dart';
-import 'package:ditonton/presentation/provider/movie_list_notifier.dart';
-import 'package:ditonton/presentation/provider/movie_search_notifier.dart';
-import 'package:ditonton/presentation/provider/popular_movies_notifier.dart';
-import 'package:ditonton/presentation/provider/top_rated_movies_notifier.dart';
-import 'package:ditonton/presentation/provider/tv_series_search_notifier.dart';
-import 'package:ditonton/presentation/provider/watchlist_movie_notifier.dart';
-import 'package:ditonton/presentation/provider/tv_series_list_notifier.dart';
-import 'package:ditonton/presentation/provider/tv_series_detail_notifier.dart';
-import 'package:ditonton/presentation/provider/popular_tv_series_notifier.dart';
-import 'package:ditonton/presentation/provider/top_rated_tv_series_notifier.dart';
-import 'package:ditonton/presentation/provider/watchlist_tv_series_notifier.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:ditonton/injection.dart' as di;
+
+// Import BLoC files
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/movie_detail/movie_detail_bloc.dart';
+import 'package:ditonton/presentation/bloc/movie_search/movie_search_bloc.dart';
+import 'package:ditonton/presentation/bloc/watchlist_movie/watchlist_movie_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_detail/tv_series_detail_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_search/tv_series_search_bloc.dart';
+import 'package:ditonton/presentation/bloc/watchlist_tv_series/watchlist_tv_series_bloc.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Pendekatan 1: Gunakan try-catch untuk menangani error dengan aman
+  FirebaseApp app;
+  try {
+    app = await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+  } catch (e) {
+    if (e.toString().contains('duplicate-app')) {
+      // Jika sudah ada, ambil instance yang ada
+      app = Firebase.app();
+    } else {
+      // Jika error lain, teruskan error
+      rethrow;
+    }
+  }
+
+  // Logging info untuk debugging
+  print('Firebase App initialized: ${app.name}');
+
+  // Initialize SSL Pinning
+  await HttpSSLPinning.init();
+
+  di.init();
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
-  
-  // Initialize SSL Pinning
-  await HttpSSLPinning.init();
-  
-  di.init();
   runApp(MyApp());
 }
 
 class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return MultiProvider(
+    return MultiBlocProvider(
       providers: [
-        ChangeNotifierProvider(
-          create: (_) => di.locator<MovieListNotifier>(),
+        BlocProvider(
+          create: (_) => di.locator<MovieListBloc>(),
         ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<MovieDetailNotifier>(),
+        BlocProvider(
+          create: (_) => di.locator<MovieDetailBloc>(),
         ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<MovieSearchNotifier>(),
+        BlocProvider(
+          create: (_) => di.locator<MovieSearchBloc>(),
         ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<TopRatedMoviesNotifier>(),
+        BlocProvider(
+          create: (_) => di.locator<WatchlistMovieBloc>(),
         ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<PopularMoviesNotifier>(),
+        BlocProvider(
+          create: (_) => di.locator<TvSeriesListBloc>(),
         ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<WatchlistMovieNotifier>(),
+        BlocProvider(
+          create: (_) => di.locator<TvSeriesDetailBloc>(),
         ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<TvSeriesListNotifier>(),
+        BlocProvider(
+          create: (_) => di.locator<TvSeriesSearchBloc>(),
         ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<TvSeriesDetailNotifier>(),
-        ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<PopularTvSeriesNotifier>(),
-        ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<TopRatedTvSeriesNotifier>(),
-        ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<WatchlistTvSeriesNotifier>(),
-        ),
-        ChangeNotifierProvider(
-          create: (_) => di.locator<TvSeriesSearchNotifier>(),
+        BlocProvider(
+          create: (_) => di.locator<WatchlistTvSeriesBloc>(),
         ),
       ],
       child: MaterialApp(
@@ -2659,6 +2860,1354 @@ class MyApp extends StatelessWidget {
   }
 }
 
+/== presentation/bloc/movie_detail/movie_detail_bloc.dart
+import 'package:bloc/bloc.dart';
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/movie.dart';
+import 'package:ditonton/domain/usecases/get_movie_detail.dart';
+import 'package:ditonton/domain/usecases/get_movie_recommendations.dart';
+import 'package:ditonton/domain/usecases/get_watchlist_status.dart';
+import 'package:ditonton/domain/usecases/remove_watchlist.dart';
+import 'package:ditonton/domain/usecases/save_watchlist.dart';
+import 'package:ditonton/presentation/bloc/movie_detail/movie_detail_event.dart';
+import 'package:ditonton/presentation/bloc/movie_detail/movie_detail_state.dart';
+
+class MovieDetailBloc extends Bloc<MovieDetailEvent, MovieDetailState> {
+  static const watchlistAddSuccessMessage = 'Added to Watchlist';
+  static const watchlistRemoveSuccessMessage = 'Removed from Watchlist';
+
+  final GetMovieDetail getMovieDetail;
+  final GetMovieRecommendations getMovieRecommendations;
+  final GetWatchListStatus getWatchListStatus;
+  final SaveWatchlist saveWatchlist;
+  final RemoveWatchlist removeWatchlist;
+
+  MovieDetailBloc({
+    required this.getMovieDetail,
+    required this.getMovieRecommendations,
+    required this.getWatchListStatus,
+    required this.saveWatchlist,
+    required this.removeWatchlist,
+  }) : super(MovieDetailState.initial()) {
+    on<FetchMovieDetail>(_onFetchMovieDetail);
+    on<AddMovieToWatchlist>(_onAddMovieToWatchlist);
+    on<RemoveMovieFromWatchlist>(_onRemoveMovieFromWatchlist);
+    on<LoadWatchlistStatus>(_onLoadWatchlistStatus);
+  }
+
+  Future<void> _onFetchMovieDetail(
+    FetchMovieDetail event,
+    Emitter<MovieDetailState> emit,
+  ) async {
+    emit(state.copyWith(movieState: RequestState.Loading));
+    
+    final detailResult = await getMovieDetail.execute(event.id);
+    
+    if (detailResult.isLeft()) {
+      final failure = detailResult.fold(
+        (l) => l,
+        (r) => null,
+      );
+      emit(state.copyWith(
+        movieState: RequestState.Error,
+        message: failure!.message,
+      ));
+      return;
+    }
+    
+    final movie = detailResult.fold(
+      (l) => null,
+      (r) => r,
+    );
+    
+    emit(state.copyWith(
+      movieState: RequestState.Loaded,
+      movieDetail: movie,
+      recommendationState: RequestState.Loading,
+    ));
+    
+    final recommendationResult = await getMovieRecommendations.execute(event.id);
+    
+    if (recommendationResult.isLeft()) {
+      final failure = recommendationResult.fold(
+        (l) => l,
+        (r) => null,
+      );
+      emit(state.copyWith(
+        recommendationState: RequestState.Error,
+        message: failure!.message,
+      ));
+    } else {
+      final recommendations = recommendationResult.fold(
+        (l) => <Movie>[], // Explicitly typed empty list
+        (r) => r,
+      );
+      emit(state.copyWith(
+        recommendationState: RequestState.Loaded,
+        recommendations: recommendations,
+      ));
+    }
+  }
+
+  Future<void> _onAddMovieToWatchlist(
+    AddMovieToWatchlist event,
+    Emitter<MovieDetailState> emit,
+  ) async {
+    final result = await saveWatchlist.execute(event.movieDetail);
+    
+    String message = watchlistAddSuccessMessage;
+    result.fold(
+      (failure) {
+        message = failure.message;
+      },
+      (successMessage) {
+        message = successMessage;
+      },
+    );
+    
+    emit(state.copyWith(watchlistMessage: message));
+    
+    // Update watchlist status
+    final status = await getWatchListStatus.execute(event.movieDetail.id);
+    emit(state.copyWith(isAddedToWatchlist: status));
+  }
+
+  Future<void> _onRemoveMovieFromWatchlist(
+    RemoveMovieFromWatchlist event,
+    Emitter<MovieDetailState> emit,
+  ) async {
+    final result = await removeWatchlist.execute(event.movieDetail);
+    
+    String message = '';
+    result.fold(
+      (failure) {
+        message = failure.message;
+      },
+      (successMessage) {
+        message = successMessage;
+      },
+    );
+    print(message);
+    emit(state.copyWith(watchlistMessage: message));
+    
+    // Update watchlist status
+    final status = await getWatchListStatus.execute(event.movieDetail.id);
+    emit(state.copyWith(isAddedToWatchlist: status));
+  }
+
+  Future<void> _onLoadWatchlistStatus(
+    LoadWatchlistStatus event,
+    Emitter<MovieDetailState> emit,
+  ) async {
+    final result = await getWatchListStatus.execute(event.id);
+    emit(state.copyWith(isAddedToWatchlist: result));
+  }
+}
+
+/== presentation/bloc/movie_detail/movie_detail_event.dart
+import 'package:ditonton/domain/entities/movie_detail.dart';
+import 'package:equatable/equatable.dart';
+
+abstract class MovieDetailEvent extends Equatable {
+  const MovieDetailEvent();
+
+  @override
+  List<Object?> get props => [];
+}
+
+class FetchMovieDetail extends MovieDetailEvent {
+  final int id;
+
+  const FetchMovieDetail(this.id);
+
+  @override
+  List<Object> get props => [id];
+}
+
+class AddMovieToWatchlist extends MovieDetailEvent {
+  final MovieDetail movieDetail;
+
+  const AddMovieToWatchlist(this.movieDetail);
+
+  @override
+  List<Object> get props => [movieDetail];
+}
+
+class RemoveMovieFromWatchlist extends MovieDetailEvent {
+  final MovieDetail movieDetail;
+
+  const RemoveMovieFromWatchlist(this.movieDetail);
+
+  @override
+  List<Object> get props => [movieDetail];
+}
+
+class LoadWatchlistStatus extends MovieDetailEvent {
+  final int id;
+
+  const LoadWatchlistStatus(this.id);
+
+  @override
+  List<Object> get props => [id];
+}
+
+/== presentation/bloc/movie_detail/movie_detail_state.dart
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/movie.dart';
+import 'package:ditonton/domain/entities/movie_detail.dart';
+import 'package:equatable/equatable.dart';
+
+class MovieDetailState extends Equatable {
+  final RequestState movieState;
+  final RequestState recommendationState;
+  final MovieDetail? movieDetail;
+  final List<Movie> recommendations;
+  final bool isAddedToWatchlist;
+  final String message;
+  final String watchlistMessage;
+
+  const MovieDetailState({
+    required this.movieState,
+    required this.recommendationState,
+    this.movieDetail,
+    required this.recommendations,
+    required this.isAddedToWatchlist,
+    required this.message,
+    required this.watchlistMessage,
+  });
+
+  factory MovieDetailState.initial() {
+    return const MovieDetailState(
+      movieState: RequestState.Empty,
+      recommendationState: RequestState.Empty,
+      movieDetail: null,
+      recommendations: [],
+      isAddedToWatchlist: false,
+      message: '',
+      watchlistMessage: '',
+    );
+  }
+
+  MovieDetailState copyWith({
+    RequestState? movieState,
+    RequestState? recommendationState,
+    MovieDetail? movieDetail,
+    List<Movie>? recommendations,
+    bool? isAddedToWatchlist,
+    String? message,
+    String? watchlistMessage,
+  }) {
+    return MovieDetailState(
+      movieState: movieState ?? this.movieState,
+      recommendationState: recommendationState ?? this.recommendationState,
+      movieDetail: movieDetail ?? this.movieDetail,
+      recommendations: recommendations ?? this.recommendations,
+      isAddedToWatchlist: isAddedToWatchlist ?? this.isAddedToWatchlist,
+      message: message ?? this.message,
+      watchlistMessage: watchlistMessage ?? this.watchlistMessage,
+    );
+  }
+
+  @override
+  List<Object?> get props => [
+        movieState,
+        recommendationState,
+        movieDetail,
+        recommendations,
+        isAddedToWatchlist,
+        message,
+        watchlistMessage,
+      ];
+}
+
+/== presentation/bloc/movie_list/movie_list_bloc.dart
+import 'package:bloc/bloc.dart';
+import 'package:ditonton/common/failure.dart';
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/usecases/get_now_playing_movies.dart';
+import 'package:ditonton/domain/usecases/get_popular_movies.dart';
+import 'package:ditonton/domain/usecases/get_top_rated_movies.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_event.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_state.dart';
+
+class MovieListBloc extends Bloc<MovieListEvent, MovieListState> {
+  final GetNowPlayingMovies getNowPlayingMovies;
+  final GetPopularMovies getPopularMovies;
+  final GetTopRatedMovies getTopRatedMovies;
+
+  MovieListBloc({
+    required this.getNowPlayingMovies,
+    required this.getPopularMovies,
+    required this.getTopRatedMovies,
+  }) : super(MovieListState.initial()) {
+    on<FetchNowPlayingMovies>(_onFetchNowPlayingMovies);
+    on<FetchPopularMovies>(_onFetchPopularMovies);
+    on<FetchTopRatedMovies>(_onFetchTopRatedMovies);
+  }
+
+  Future<void> _onFetchNowPlayingMovies(
+    FetchNowPlayingMovies event,
+    Emitter<MovieListState> emit,
+  ) async {
+    emit(state.copyWith(nowPlayingState: RequestState.Loading));
+
+    try {
+      final result = await getNowPlayingMovies.execute();
+      result.fold(
+        (failure) {
+          final message = _mapFailureToMessage(failure);
+          emit(state.copyWith(
+            nowPlayingState: RequestState.Error,
+            message: message,
+          ));
+        },
+        (movies) {
+          emit(state.copyWith(
+            nowPlayingState: RequestState.Loaded,
+            nowPlayingMovies: movies,
+          ));
+        },
+      );
+    } catch (e) {
+      emit(state.copyWith(
+        nowPlayingState: RequestState.Error,
+        message: e.toString(),
+      ));
+    }
+  }
+
+  Future<void> _onFetchPopularMovies(
+    FetchPopularMovies event,
+    Emitter<MovieListState> emit,
+  ) async {
+    emit(state.copyWith(popularMoviesState: RequestState.Loading));
+
+    try {
+      final result = await getPopularMovies.execute();
+      result.fold(
+        (failure) {
+          final message = _mapFailureToMessage(failure);
+          emit(state.copyWith(
+            popularMoviesState: RequestState.Error,
+            message: message,
+          ));
+        },
+        (movies) {
+          emit(state.copyWith(
+            popularMoviesState: RequestState.Loaded,
+            popularMovies: movies,
+          ));
+        },
+      );
+    } catch (e) {
+      emit(state.copyWith(
+        popularMoviesState: RequestState.Error,
+        message: e.toString(),
+      ));
+    }
+  }
+
+  Future<void> _onFetchTopRatedMovies(
+    FetchTopRatedMovies event,
+    Emitter<MovieListState> emit,
+  ) async {
+    emit(state.copyWith(topRatedMoviesState: RequestState.Loading));
+
+    try {
+      final result = await getTopRatedMovies.execute();
+      result.fold(
+        (failure) {
+          final message = _mapFailureToMessage(failure);
+          emit(state.copyWith(
+            topRatedMoviesState: RequestState.Error,
+            message: message,
+          ));
+        },
+        (movies) {
+          emit(state.copyWith(
+            topRatedMoviesState: RequestState.Loaded,
+            topRatedMovies: movies,
+          ));
+        },
+      );
+    } catch (e) {
+      emit(state.copyWith(
+        topRatedMoviesState: RequestState.Error,
+        message: e.toString(),
+      ));
+    }
+  }
+
+  String _mapFailureToMessage(Failure failure) {
+    if (failure is ConnectionFailure) {
+      return 'Failed to connect to the network';
+    } else if (failure is ServerFailure) {
+      return 'Failed to connect to the server';
+    } else {
+      return 'Unexpected error';
+    }
+  }
+}
+
+/== presentation/bloc/movie_list/movie_list_event.dart
+import 'package:equatable/equatable.dart';
+
+abstract class MovieListEvent extends Equatable {
+  const MovieListEvent();
+
+  @override
+  List<Object> get props => [];
+}
+
+class FetchNowPlayingMovies extends MovieListEvent {}
+
+class FetchPopularMovies extends MovieListEvent {}
+
+class FetchTopRatedMovies extends MovieListEvent {}
+
+
+/== presentation/bloc/movie_list/movie_list_state.dart
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/movie.dart';
+import 'package:equatable/equatable.dart';
+
+class MovieListState extends Equatable {
+  final RequestState nowPlayingState;
+  final RequestState popularMoviesState;
+  final RequestState topRatedMoviesState;
+  final List<Movie> nowPlayingMovies;
+  final List<Movie> popularMovies;
+  final List<Movie> topRatedMovies;
+  final String message;
+
+  const MovieListState({
+    required this.nowPlayingState,
+    required this.popularMoviesState,
+    required this.topRatedMoviesState,
+    required this.nowPlayingMovies,
+    required this.popularMovies,
+    required this.topRatedMovies,
+    required this.message,
+  });
+
+  factory MovieListState.initial() {
+    return MovieListState(
+      nowPlayingState: RequestState.Empty,
+      popularMoviesState: RequestState.Empty,
+      topRatedMoviesState: RequestState.Empty,
+      nowPlayingMovies: [],
+      popularMovies: [],
+      topRatedMovies: [],
+      message: '',
+    );
+  }
+
+  MovieListState copyWith({
+    RequestState? nowPlayingState,
+    RequestState? popularMoviesState,
+    RequestState? topRatedMoviesState,
+    List<Movie>? nowPlayingMovies,
+    List<Movie>? popularMovies,
+    List<Movie>? topRatedMovies,
+    String? message,
+  }) {
+    return MovieListState(
+      nowPlayingState: nowPlayingState ?? this.nowPlayingState,
+      popularMoviesState: popularMoviesState ?? this.popularMoviesState,
+      topRatedMoviesState: topRatedMoviesState ?? this.topRatedMoviesState,
+      nowPlayingMovies: nowPlayingMovies ?? this.nowPlayingMovies,
+      popularMovies: popularMovies ?? this.popularMovies,
+      topRatedMovies: topRatedMovies ?? this.topRatedMovies,
+      message: message ?? this.message,
+    );
+  }
+
+  @override
+  List<Object> get props => [
+        nowPlayingState,
+        popularMoviesState,
+        topRatedMoviesState,
+        nowPlayingMovies,
+        popularMovies,
+        topRatedMovies,
+        message,
+      ];
+}
+
+/== presentation/bloc/movie_search/movie_search_bloc.dart
+import 'package:bloc/bloc.dart';
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/usecases/search_movies.dart';
+import 'package:ditonton/presentation/bloc/movie_search/movie_search_event.dart';
+import 'package:ditonton/presentation/bloc/movie_search/movie_search_state.dart';
+
+class MovieSearchBloc extends Bloc<MovieSearchEvent, MovieSearchState> {
+  final SearchMovies searchMovies;
+
+  MovieSearchBloc({required this.searchMovies}) : super(MovieSearchState.initial()) {
+    on<QueryChanged>(_onQueryChanged);
+  }
+
+  Future<void> _onQueryChanged(
+    QueryChanged event,
+    Emitter<MovieSearchState> emit,
+  ) async {
+    final query = event.query;
+
+    if (query.isEmpty) {
+      emit(MovieSearchState.initial());
+      return;
+    }
+
+    emit(state.copyWith(state: RequestState.Loading));
+
+    final result = await searchMovies.execute(query);
+    result.fold(
+      (failure) {
+        emit(state.copyWith(
+          state: RequestState.Error,
+          message: failure.message,
+        ));
+      },
+      (data) {
+        emit(state.copyWith(
+          state: RequestState.Loaded,
+          searchResult: data,
+        ));
+      },
+    );
+  }
+}
+
+/== presentation/bloc/movie_search/movie_search_event.dart
+import 'package:equatable/equatable.dart';
+
+abstract class MovieSearchEvent extends Equatable {
+  const MovieSearchEvent();
+
+  @override
+  List<Object> get props => [];
+}
+
+class QueryChanged extends MovieSearchEvent {
+  final String query;
+
+  const QueryChanged(this.query);
+
+  @override
+  List<Object> get props => [query];
+}
+
+
+/== presentation/bloc/movie_search/movie_search_state.dart
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/movie.dart';
+import 'package:equatable/equatable.dart';
+
+class MovieSearchState extends Equatable {
+  final RequestState state;
+  final List<Movie> searchResult;
+  final String message;
+
+  const MovieSearchState({
+    required this.state,
+    required this.searchResult,
+    required this.message,
+  });
+
+  factory MovieSearchState.initial() {
+    return const MovieSearchState(
+      state: RequestState.Empty,
+      searchResult: [],
+      message: '',
+    );
+  }
+
+  MovieSearchState copyWith({
+    RequestState? state,
+    List<Movie>? searchResult,
+    String? message,
+  }) {
+    return MovieSearchState(
+      state: state ?? this.state,
+      searchResult: searchResult ?? this.searchResult,
+      message: message ?? this.message,
+    );
+  }
+
+  @override
+  List<Object> get props => [state, searchResult, message];
+}
+
+/== presentation/bloc/tv_series_detail/tv_series_detail_bloc.dart
+import 'package:bloc/bloc.dart';
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/tv_series.dart';
+import 'package:ditonton/domain/usecases/get_tv_series_detail.dart';
+import 'package:ditonton/domain/usecases/get_tv_series_recommendations.dart';
+import 'package:ditonton/domain/usecases/get_watchlist_status_tv_series.dart';
+import 'package:ditonton/domain/usecases/remove_watchlist_tv_series.dart';
+import 'package:ditonton/domain/usecases/save_watchlist_tv_series.dart';
+import 'package:ditonton/presentation/bloc/tv_series_detail/tv_series_detail_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_detail/tv_series_detail_state.dart';
+
+class TvSeriesDetailBloc extends Bloc<TvSeriesDetailEvent, TvSeriesDetailState> {
+  static const watchlistAddSuccessMessage = 'Added to Watchlist';
+  static const watchlistRemoveSuccessMessage = 'Removed from Watchlist';
+
+  final GetTvSeriesDetail getTvSeriesDetail;
+  final GetTvSeriesRecommendations getTvSeriesRecommendations;
+  final GetWatchListStatusTvSeries getWatchListStatus;
+  final SaveWatchlistTvSeries saveWatchlist;
+  final RemoveWatchlistTvSeries removeWatchlist;
+
+  TvSeriesDetailBloc({
+    required this.getTvSeriesDetail,
+    required this.getWatchListStatus,
+    required this.saveWatchlist,
+    required this.removeWatchlist,
+    required this.getTvSeriesRecommendations,
+  }) : super(TvSeriesDetailState.initial()) {
+    on<FetchTvSeriesDetail>(_onFetchTvSeriesDetail);
+    on<AddTvSeriesToWatchlist>(_onAddTvSeriesToWatchlist);
+    on<RemoveTvSeriesFromWatchlist>(_onRemoveTvSeriesFromWatchlist);
+    on<LoadTvSeriesWatchlistStatus>(_onLoadTvSeriesWatchlistStatus);
+  }
+
+  Future<void> _onFetchTvSeriesDetail(
+    FetchTvSeriesDetail event,
+    Emitter<TvSeriesDetailState> emit,
+  ) async {
+    emit(state.copyWith(tvSeriesState: RequestState.Loading));
+
+    final detailResult = await getTvSeriesDetail.execute(event.id);
+
+    if (detailResult.isLeft()) {
+      final failure = detailResult.fold(
+        (l) => l,
+        (r) => null,
+      );
+      emit(state.copyWith(
+        tvSeriesState: RequestState.Error,
+        message: failure!.message,
+      ));
+      return;
+    }
+    
+    final tvSeries = detailResult.fold(
+      (l) => null,
+      (r) => r,
+    );
+    
+    emit(state.copyWith(
+      tvSeriesState: RequestState.Loaded,
+      tvSeriesDetail: tvSeries,
+      recommendationState: RequestState.Loading,
+    ));
+    
+    final recommendationResult = await getTvSeriesRecommendations.execute(event.id);
+    
+    if (recommendationResult.isLeft()) {
+      final failure = recommendationResult.fold(
+        (l) => l,
+        (r) => null,
+      );
+      emit(state.copyWith(
+        recommendationState: RequestState.Error,
+        message: failure!.message,
+      ));
+    } else {
+      final recommendations = recommendationResult.fold(
+        (l) => <TvSeries>[], // Explicitly typed empty list
+        (r) => r,
+      );
+      emit(state.copyWith(
+        recommendationState: RequestState.Loaded,
+        recommendations: recommendations,
+      ));
+    }
+  }
+
+  Future<void> _onAddTvSeriesToWatchlist(
+    AddTvSeriesToWatchlist event,
+    Emitter<TvSeriesDetailState> emit,
+  ) async {
+    final result = await saveWatchlist.execute(event.tvSeriesDetail);
+
+    String message = watchlistAddSuccessMessage;
+    result.fold(
+      (failure) {
+        message = failure.message;
+      },
+      (successMessage) {
+        message = successMessage;
+      },
+    );
+    
+    emit(state.copyWith(watchlistMessage: message));
+    
+    // Update watchlist status after adding
+    final status = await getWatchListStatus.execute(event.tvSeriesDetail.id);
+    emit(state.copyWith(isAddedToWatchlist: status));
+  }
+
+  Future<void> _onRemoveTvSeriesFromWatchlist(
+    RemoveTvSeriesFromWatchlist event,
+    Emitter<TvSeriesDetailState> emit,
+  ) async {
+    final result = await removeWatchlist.execute(event.tvSeriesDetail);
+
+    String message = '';
+    result.fold(
+      (failure) {
+        message = failure.message;
+      },
+      (successMessage) {
+        message = successMessage;
+      },
+    );
+    
+    emit(state.copyWith(watchlistMessage: message));
+    
+    // Update watchlist status after removing
+    final status = await getWatchListStatus.execute(event.tvSeriesDetail.id);
+    emit(state.copyWith(isAddedToWatchlist: status));
+  }
+
+  Future<void> _onLoadTvSeriesWatchlistStatus(
+    LoadTvSeriesWatchlistStatus event,
+    Emitter<TvSeriesDetailState> emit,
+  ) async {
+    final result = await getWatchListStatus.execute(event.id);
+    emit(state.copyWith(isAddedToWatchlist: result));
+  }
+}
+
+/== presentation/bloc/tv_series_detail/tv_series_detail_event.dart
+import 'package:ditonton/domain/entities/tv_series_detail.dart';
+import 'package:equatable/equatable.dart';
+
+abstract class TvSeriesDetailEvent extends Equatable {
+  const TvSeriesDetailEvent();
+
+  @override
+  List<Object?> get props => [];
+}
+
+class FetchTvSeriesDetail extends TvSeriesDetailEvent {
+  final int id;
+
+  const FetchTvSeriesDetail(this.id);
+
+  @override
+  List<Object> get props => [id];
+}
+
+class AddTvSeriesToWatchlist extends TvSeriesDetailEvent {
+  final TvSeriesDetail tvSeriesDetail;
+
+  const AddTvSeriesToWatchlist(this.tvSeriesDetail);
+
+  @override
+  List<Object> get props => [tvSeriesDetail];
+}
+
+class RemoveTvSeriesFromWatchlist extends TvSeriesDetailEvent {
+  final TvSeriesDetail tvSeriesDetail;
+
+  const RemoveTvSeriesFromWatchlist(this.tvSeriesDetail);
+
+  @override
+  List<Object> get props => [tvSeriesDetail];
+}
+
+class LoadTvSeriesWatchlistStatus extends TvSeriesDetailEvent {
+  final int id;
+
+  const LoadTvSeriesWatchlistStatus(this.id);
+
+  @override
+  List<Object> get props => [id];
+}
+
+/== presentation/bloc/tv_series_detail/tv_series_detail_state.dart
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/tv_series.dart';
+import 'package:ditonton/domain/entities/tv_series_detail.dart';
+import 'package:equatable/equatable.dart';
+
+class TvSeriesDetailState extends Equatable {
+  final RequestState tvSeriesState;
+  final RequestState recommendationState;
+  final TvSeriesDetail? tvSeriesDetail;
+  final List<TvSeries> recommendations;
+  final bool isAddedToWatchlist;
+  final String message;
+  final String watchlistMessage;
+
+  const TvSeriesDetailState({
+    required this.tvSeriesState,
+    required this.recommendationState,
+    this.tvSeriesDetail,
+    required this.recommendations,
+    required this.isAddedToWatchlist,
+    required this.message,
+    required this.watchlistMessage,
+  });
+
+  factory TvSeriesDetailState.initial() {
+    return const TvSeriesDetailState(
+      tvSeriesState: RequestState.Empty,
+      recommendationState: RequestState.Empty,
+      tvSeriesDetail: null,
+      recommendations: [],
+      isAddedToWatchlist: false,
+      message: '',
+      watchlistMessage: '',
+    );
+  }
+
+  TvSeriesDetailState copyWith({
+    RequestState? tvSeriesState,
+    RequestState? recommendationState,
+    TvSeriesDetail? tvSeriesDetail,
+    List<TvSeries>? recommendations,
+    bool? isAddedToWatchlist,
+    String? message,
+    String? watchlistMessage,
+  }) {
+    return TvSeriesDetailState(
+      tvSeriesState: tvSeriesState ?? this.tvSeriesState,
+      recommendationState: recommendationState ?? this.recommendationState,
+      tvSeriesDetail: tvSeriesDetail ?? this.tvSeriesDetail,
+      recommendations: recommendations ?? this.recommendations,
+      isAddedToWatchlist: isAddedToWatchlist ?? this.isAddedToWatchlist,
+      message: message ?? this.message,
+      watchlistMessage: watchlistMessage ?? this.watchlistMessage,
+    );
+  }
+
+  @override
+  List<Object?> get props => [
+        tvSeriesState,
+        recommendationState,
+        tvSeriesDetail,
+        recommendations,
+        isAddedToWatchlist,
+        message,
+        watchlistMessage,
+      ];
+}
+
+
+/== presentation/bloc/tv_series_list/tv_series_list_bloc.dart
+import 'package:bloc/bloc.dart';
+import 'package:ditonton/common/failure.dart';
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/usecases/get_now_playing_tv_series.dart';
+import 'package:ditonton/domain/usecases/get_popular_tv_series.dart';
+import 'package:ditonton/domain/usecases/get_top_rated_tv_series.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_state.dart';
+
+class TvSeriesListBloc extends Bloc<TvSeriesListEvent, TvSeriesListState> {
+  final GetNowPlayingTvSeries getNowPlayingTvSeries;
+  final GetPopularTvSeries getPopularTvSeries;
+  final GetTopRatedTvSeries getTopRatedTvSeries;
+
+  TvSeriesListBloc({
+    required this.getNowPlayingTvSeries,
+    required this.getPopularTvSeries,
+    required this.getTopRatedTvSeries,
+  }) : super(TvSeriesListState.initial()) {
+    on<FetchNowPlayingTvSeries>(_onFetchNowPlayingTvSeries);
+    on<FetchPopularTvSeries>(_onFetchPopularTvSeries);
+    on<FetchTopRatedTvSeries>(_onFetchTopRatedTvSeries);
+  }
+
+  Future<void> _onFetchNowPlayingTvSeries(
+    FetchNowPlayingTvSeries event,
+    Emitter<TvSeriesListState> emit,
+  ) async {
+    emit(state.copyWith(nowPlayingState: RequestState.Loading));
+
+    try {
+      final result = await getNowPlayingTvSeries.execute();
+      result.fold(
+        (failure) {
+          final message = _mapFailureToMessage(failure);
+          emit(state.copyWith(
+            nowPlayingState: RequestState.Error,
+            message: message,
+          ));
+        },
+        (seriesData) {
+          emit(state.copyWith(
+            nowPlayingState: RequestState.Loaded,
+            nowPlayingTvSeries: seriesData,
+          ));
+        },
+      );
+    } catch (e) {
+      emit(state.copyWith(
+        nowPlayingState: RequestState.Error,
+        message: e.toString(),
+      ));
+    }
+  }
+
+  Future<void> _onFetchPopularTvSeries(
+    FetchPopularTvSeries event,
+    Emitter<TvSeriesListState> emit,
+  ) async {
+    emit(state.copyWith(popularTvSeriesState: RequestState.Loading));
+
+    try {
+      final result = await getPopularTvSeries.execute();
+      result.fold(
+        (failure) {
+          final message = _mapFailureToMessage(failure);
+          emit(state.copyWith(
+            popularTvSeriesState: RequestState.Error,
+            message: message,
+          ));
+        },
+        (seriesData) {
+          emit(state.copyWith(
+            popularTvSeriesState: RequestState.Loaded,
+            popularTvSeries: seriesData,
+          ));
+        },
+      );
+    } catch (e) {
+      emit(state.copyWith(
+        popularTvSeriesState: RequestState.Error,
+        message: e.toString(),
+      ));
+    }
+  }
+
+  Future<void> _onFetchTopRatedTvSeries(
+    FetchTopRatedTvSeries event,
+    Emitter<TvSeriesListState> emit,
+  ) async {
+    emit(state.copyWith(topRatedTvSeriesState: RequestState.Loading));
+
+    try {
+      final result = await getTopRatedTvSeries.execute();
+      result.fold(
+        (failure) {
+          final message = _mapFailureToMessage(failure);
+          emit(state.copyWith(
+            topRatedTvSeriesState: RequestState.Error,
+            message: message,
+          ));
+        },
+        (seriesData) {
+          emit(state.copyWith(
+            topRatedTvSeriesState: RequestState.Loaded,
+            topRatedTvSeries: seriesData,
+          ));
+        },
+      );
+    } catch (e) {
+      emit(state.copyWith(
+        topRatedTvSeriesState: RequestState.Error,
+        message: e.toString(),
+      ));
+    }
+  }
+
+  String _mapFailureToMessage(Failure failure) {
+    if (failure is ConnectionFailure) {
+      return 'Failed to connect to the network';
+    } else if (failure is ServerFailure) {
+      return 'Failed to connect to the server';
+    } else {
+      return 'Unexpected error';
+    }
+  }
+}
+
+/== presentation/bloc/tv_series_list/tv_series_list_event.dart
+import 'package:equatable/equatable.dart';
+
+abstract class TvSeriesListEvent extends Equatable {
+  const TvSeriesListEvent();
+
+  @override
+  List<Object> get props => [];
+}
+
+class FetchNowPlayingTvSeries extends TvSeriesListEvent {}
+
+class FetchPopularTvSeries extends TvSeriesListEvent {}
+
+class FetchTopRatedTvSeries extends TvSeriesListEvent {}
+
+/== presentation/bloc/tv_series_list/tv_series_list_state.dart
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/tv_series.dart';
+import 'package:equatable/equatable.dart';
+
+class TvSeriesListState extends Equatable {
+  final RequestState nowPlayingState;
+  final RequestState popularTvSeriesState;
+  final RequestState topRatedTvSeriesState;
+  final List<TvSeries> nowPlayingTvSeries;
+  final List<TvSeries> popularTvSeries;
+  final List<TvSeries> topRatedTvSeries;
+  final String message;
+
+  const TvSeriesListState({
+    required this.nowPlayingState,
+    required this.popularTvSeriesState,
+    required this.topRatedTvSeriesState,
+    required this.nowPlayingTvSeries,
+    required this.popularTvSeries,
+    required this.topRatedTvSeries,
+    required this.message,
+  });
+
+  factory TvSeriesListState.initial() {
+    return const TvSeriesListState(
+      nowPlayingState: RequestState.Empty,
+      popularTvSeriesState: RequestState.Empty,
+      topRatedTvSeriesState: RequestState.Empty,
+      nowPlayingTvSeries: [],
+      popularTvSeries: [],
+      topRatedTvSeries: [],
+      message: '',
+    );
+  }
+
+  TvSeriesListState copyWith({
+    RequestState? nowPlayingState,
+    RequestState? popularTvSeriesState,
+    RequestState? topRatedTvSeriesState,
+    List<TvSeries>? nowPlayingTvSeries,
+    List<TvSeries>? popularTvSeries,
+    List<TvSeries>? topRatedTvSeries,
+    String? message,
+  }) {
+    return TvSeriesListState(
+      nowPlayingState: nowPlayingState ?? this.nowPlayingState,
+      popularTvSeriesState: popularTvSeriesState ?? this.popularTvSeriesState,
+      topRatedTvSeriesState: topRatedTvSeriesState ?? this.topRatedTvSeriesState,
+      nowPlayingTvSeries: nowPlayingTvSeries ?? this.nowPlayingTvSeries,
+      popularTvSeries: popularTvSeries ?? this.popularTvSeries,
+      topRatedTvSeries: topRatedTvSeries ?? this.topRatedTvSeries,
+      message: message ?? this.message,
+    );
+  }
+
+  @override
+  List<Object> get props => [
+        nowPlayingState,
+        popularTvSeriesState,
+        topRatedTvSeriesState,
+        nowPlayingTvSeries,
+        popularTvSeries,
+        topRatedTvSeries,
+        message,
+      ];
+}
+
+/== presentation/bloc/tv_series_search/tv_series_search_bloc.dart
+import 'package:bloc/bloc.dart';
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/usecases/search_tv_series.dart';
+import 'package:ditonton/presentation/bloc/tv_series_search/tv_series_search_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_search/tv_series_search_state.dart';
+
+class TvSeriesSearchBloc extends Bloc<TvSeriesSearchEvent, TvSeriesSearchState> {
+  final SearchTvSeries searchTvSeries;
+
+  TvSeriesSearchBloc({required this.searchTvSeries})
+      : super(TvSeriesSearchState.initial()) {
+    on<QueryChanged>(_onQueryChanged);
+  }
+
+  Future<void> _onQueryChanged(
+    QueryChanged event,
+    Emitter<TvSeriesSearchState> emit,
+  ) async {
+    final query = event.query;
+
+    if (query.isEmpty) {
+      emit(TvSeriesSearchState.initial());
+      return;
+    }
+
+    emit(state.copyWith(state: RequestState.Loading));
+
+    final result = await searchTvSeries.execute(query);
+    result.fold(
+      (failure) {
+        emit(state.copyWith(
+          state: RequestState.Error,
+          message: failure.message,
+        ));
+      },
+      (data) {
+        emit(state.copyWith(
+          state: RequestState.Loaded,
+          searchResult: data,
+        ));
+      },
+    );
+  }
+}
+
+/== presentation/bloc/tv_series_search/tv_series_search_event.dart
+import 'package:equatable/equatable.dart';
+
+abstract class TvSeriesSearchEvent extends Equatable {
+  const TvSeriesSearchEvent();
+
+  @override
+  List<Object> get props => [];
+}
+
+class QueryChanged extends TvSeriesSearchEvent {
+  final String query;
+
+  const QueryChanged(this.query);
+
+  @override
+  List<Object> get props => [query];
+}
+
+
+
+
+
+/== presentation/bloc/tv_series_search/tv_series_search_state.dart
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/tv_series.dart';
+import 'package:equatable/equatable.dart';
+
+class TvSeriesSearchState extends Equatable {
+  final RequestState state;
+  final List<TvSeries> searchResult;
+  final String message;
+
+  const TvSeriesSearchState({
+    required this.state,
+    required this.searchResult,
+    required this.message,
+  });
+
+  factory TvSeriesSearchState.initial() {
+    return const TvSeriesSearchState(
+      state: RequestState.Empty,
+      searchResult: [],
+      message: '',
+    );
+  }
+
+  TvSeriesSearchState copyWith({
+    RequestState? state,
+    List<TvSeries>? searchResult,
+    String? message,
+  }) {
+    return TvSeriesSearchState(
+      state: state ?? this.state,
+      searchResult: searchResult ?? this.searchResult,
+      message: message ?? this.message,
+    );
+  }
+
+  @override
+  List<Object> get props => [state, searchResult, message];
+}
+
+
+/== presentation/bloc/watchlist_movie/watchlist_movie_bloc.dart
+import 'package:bloc/bloc.dart';
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/usecases/get_watchlist_movies.dart';
+import 'package:ditonton/presentation/bloc/watchlist_movie/watchlist_movie_event.dart';
+import 'package:ditonton/presentation/bloc/watchlist_movie/watchlist_movie_state.dart';
+
+class WatchlistMovieBloc extends Bloc<WatchlistMovieEvent, WatchlistMovieState> {
+  final GetWatchlistMovies getWatchlistMovies;
+
+  WatchlistMovieBloc({required this.getWatchlistMovies})
+      : super(WatchlistMovieState.initial()) {
+    on<FetchWatchlistMovies>(_onFetchWatchlistMovies);
+  }
+
+  Future<void> _onFetchWatchlistMovies(
+    FetchWatchlistMovies event,
+    Emitter<WatchlistMovieState> emit,
+  ) async {
+    emit(state.copyWith(watchlistState: RequestState.Loading));
+
+    final result = await getWatchlistMovies.execute();
+    result.fold(
+      (failure) {
+        emit(state.copyWith(
+          watchlistState: RequestState.Error,
+          message: failure.message,
+        ));
+      },
+      (moviesData) {
+        emit(state.copyWith(
+          watchlistState: RequestState.Loaded,
+          watchlistMovies: moviesData,
+        ));
+      },
+    );
+  }
+}
+
+/== presentation/bloc/watchlist_movie/watchlist_movie_event.dart
+import 'package:equatable/equatable.dart';
+
+abstract class WatchlistMovieEvent extends Equatable {
+  const WatchlistMovieEvent();
+
+  @override
+  List<Object> get props => [];
+}
+
+class FetchWatchlistMovies extends WatchlistMovieEvent {}
+
+/== presentation/bloc/watchlist_movie/watchlist_movie_state.dart
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/movie.dart';
+import 'package:equatable/equatable.dart';
+
+class WatchlistMovieState extends Equatable {
+  final RequestState watchlistState;
+  final List<Movie> watchlistMovies;
+  final String message;
+
+  const WatchlistMovieState({
+    required this.watchlistState,
+    required this.watchlistMovies,
+    required this.message,
+  });
+
+  factory WatchlistMovieState.initial() {
+    return const WatchlistMovieState(
+      watchlistState: RequestState.Empty,
+      watchlistMovies: [],
+      message: '',
+    );
+  }
+
+  WatchlistMovieState copyWith({
+    RequestState? watchlistState,
+    List<Movie>? watchlistMovies,
+    String? message,
+  }) {
+    return WatchlistMovieState(
+      watchlistState: watchlistState ?? this.watchlistState,
+      watchlistMovies: watchlistMovies ?? this.watchlistMovies,
+      message: message ?? this.message,
+    );
+  }
+
+  @override
+  List<Object> get props => [watchlistState, watchlistMovies, message];
+}
+
+/== presentation/bloc/watchlist_tv_series/watchlist_tv_series_bloc.dart
+import 'package:bloc/bloc.dart';
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/usecases/get_watchlist_tv_series.dart';
+import 'package:ditonton/presentation/bloc/watchlist_tv_series/watchlist_tv_series_event.dart';
+import 'package:ditonton/presentation/bloc/watchlist_tv_series/watchlist_tv_series_state.dart';
+
+class WatchlistTvSeriesBloc
+    extends Bloc<WatchlistTvSeriesEvent, WatchlistTvSeriesState> {
+  final GetWatchlistTvSeries getWatchlistTvSeries;
+
+  WatchlistTvSeriesBloc({required this.getWatchlistTvSeries})
+      : super(WatchlistTvSeriesState.initial()) {
+    on<FetchWatchlistTvSeries>(_onFetchWatchlistTvSeries);
+  }
+
+  Future<void> _onFetchWatchlistTvSeries(
+    FetchWatchlistTvSeries event,
+    Emitter<WatchlistTvSeriesState> emit,
+  ) async {
+    emit(state.copyWith(watchlistState: RequestState.Loading));
+
+    final result = await getWatchlistTvSeries.execute();
+    result.fold(
+      (failure) {
+        emit(state.copyWith(
+          watchlistState: RequestState.Error,
+          message: failure.message,
+        ));
+      },
+      (seriesData) {
+        emit(state.copyWith(
+          watchlistState: RequestState.Loaded,
+          watchlistTvSeries: seriesData,
+        ));
+      },
+    );
+  }
+}
+
+/== presentation/bloc/watchlist_tv_series/watchlist_tv_series_event.dart
+import 'package:equatable/equatable.dart';
+
+abstract class WatchlistTvSeriesEvent extends Equatable {
+  const WatchlistTvSeriesEvent();
+
+  @override
+  List<Object> get props => [];
+}
+
+class FetchWatchlistTvSeries extends WatchlistTvSeriesEvent {}
+
+
+/== presentation/bloc/watchlist_tv_series/watchlist_tv_series_state.dart
+import 'package:ditonton/common/state_enum.dart';
+import 'package:ditonton/domain/entities/tv_series.dart';
+import 'package:equatable/equatable.dart';
+
+class WatchlistTvSeriesState extends Equatable {
+  final RequestState watchlistState;
+  final List<TvSeries> watchlistTvSeries;
+  final String message;
+
+  const WatchlistTvSeriesState({
+    required this.watchlistState,
+    required this.watchlistTvSeries,
+    required this.message,
+  });
+
+  factory WatchlistTvSeriesState.initial() {
+    return const WatchlistTvSeriesState(
+      watchlistState: RequestState.Empty,
+      watchlistTvSeries: [],
+      message: '',
+    );
+  }
+
+  WatchlistTvSeriesState copyWith({
+    RequestState? watchlistState,
+    List<TvSeries>? watchlistTvSeries,
+    String? message,
+  }) {
+    return WatchlistTvSeriesState(
+      watchlistState: watchlistState ?? this.watchlistState,
+      watchlistTvSeries: watchlistTvSeries ?? this.watchlistTvSeries,
+      message: message ?? this.message,
+    );
+  }
+
+  @override
+  List<Object> get props => [watchlistState, watchlistTvSeries, message];
+}
+
+
 /== presentation/pages/about_page.dart
 import 'package:ditonton/common/constants.dart';
 import 'package:flutter/material.dart';
@@ -2714,6 +4263,9 @@ class AboutPage extends StatelessWidget {
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:ditonton/common/constants.dart';
 import 'package:ditonton/domain/entities/movie.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_event.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_state.dart';
 import 'package:ditonton/presentation/pages/about_page.dart';
 import 'package:ditonton/presentation/pages/movie_detail_page.dart';
 import 'package:ditonton/presentation/pages/popular_movies_page.dart';
@@ -2721,10 +4273,9 @@ import 'package:ditonton/presentation/pages/search_page.dart';
 import 'package:ditonton/presentation/pages/top_rated_movies_page.dart';
 import 'package:ditonton/presentation/pages/watchlist_movies_page.dart';
 import 'package:ditonton/presentation/pages/home_tv_series_page.dart';
-import 'package:ditonton/presentation/provider/movie_list_notifier.dart';
 import 'package:ditonton/common/state_enum.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class HomeMoviePage extends StatefulWidget {
   static const ROUTE_NAME = '/home-movie';
@@ -2737,11 +4288,11 @@ class _HomeMoviePageState extends State<HomeMoviePage> {
   @override
   void initState() {
     super.initState();
-    Future.microtask(
-        () => Provider.of<MovieListNotifier>(context, listen: false)
-          ..fetchNowPlayingMovies()
-          ..fetchPopularMovies()
-          ..fetchTopRatedMovies());
+    Future.microtask(() {
+      context.read<MovieListBloc>().add(FetchNowPlayingMovies());
+      context.read<MovieListBloc>().add(FetchPopularMovies());
+      context.read<MovieListBloc>().add(FetchTopRatedMovies());
+    });
   }
 
   @override
@@ -2813,52 +4364,64 @@ class _HomeMoviePageState extends State<HomeMoviePage> {
                 'Now Playing',
                 style: kHeading6,
               ),
-              Consumer<MovieListNotifier>(builder: (context, data, child) {
-                final state = data.nowPlayingState;
-                if (state == RequestState.Loading) {
-                  return Center(
-                    child: CircularProgressIndicator(),
-                  );
-                } else if (state == RequestState.Loaded) {
-                  return MovieList(data.nowPlayingMovies);
-                } else {
-                  return Text('Failed');
-                }
-              }),
+              BlocBuilder<MovieListBloc, MovieListState>(
+                builder: (context, state) {
+                  final nowPlayingState = state.nowPlayingState;
+                  if (nowPlayingState == RequestState.Loading) {
+                    return Center(
+                      child: CircularProgressIndicator(),
+                    );
+                  } else if (nowPlayingState == RequestState.Loaded) {
+                    return MovieList(state.nowPlayingMovies);
+                  } else if (nowPlayingState == RequestState.Error) {
+                    return Text('Failed: ${state.message}');
+                  } else {
+                    return Container();
+                  }
+                },
+              ),
               _buildSubHeading(
                 title: 'Popular',
                 onTap: () =>
                     Navigator.pushNamed(context, PopularMoviesPage.ROUTE_NAME),
               ),
-              Consumer<MovieListNotifier>(builder: (context, data, child) {
-                final state = data.popularMoviesState;
-                if (state == RequestState.Loading) {
-                  return Center(
-                    child: CircularProgressIndicator(),
-                  );
-                } else if (state == RequestState.Loaded) {
-                  return MovieList(data.popularMovies);
-                } else {
-                  return Text('Failed');
-                }
-              }),
+              BlocBuilder<MovieListBloc, MovieListState>(
+                builder: (context, state) {
+                  final popularMoviesState = state.popularMoviesState;
+                  if (popularMoviesState == RequestState.Loading) {
+                    return Center(
+                      child: CircularProgressIndicator(),
+                    );
+                  } else if (popularMoviesState == RequestState.Loaded) {
+                    return MovieList(state.popularMovies);
+                  } else if (popularMoviesState == RequestState.Error) {
+                    return Text('Failed: ${state.message}');
+                  } else {
+                    return Container();
+                  }
+                },
+              ),
               _buildSubHeading(
                 title: 'Top Rated',
                 onTap: () =>
                     Navigator.pushNamed(context, TopRatedMoviesPage.ROUTE_NAME),
               ),
-              Consumer<MovieListNotifier>(builder: (context, data, child) {
-                final state = data.topRatedMoviesState;
-                if (state == RequestState.Loading) {
-                  return Center(
-                    child: CircularProgressIndicator(),
-                  );
-                } else if (state == RequestState.Loaded) {
-                  return MovieList(data.topRatedMovies);
-                } else {
-                  return Text('Failed');
-                }
-              }),
+              BlocBuilder<MovieListBloc, MovieListState>(
+                builder: (context, state) {
+                  final topRatedMoviesState = state.topRatedMoviesState;
+                  if (topRatedMoviesState == RequestState.Loading) {
+                    return Center(
+                      child: CircularProgressIndicator(),
+                    );
+                  } else if (topRatedMoviesState == RequestState.Loaded) {
+                    return MovieList(state.topRatedMovies);
+                  } else if (topRatedMoviesState == RequestState.Error) {
+                    return Text('Failed: ${state.message}');
+                  } else {
+                    return Container();
+                  }
+                },
+              ),
             ],
           ),
         ),
@@ -2930,11 +4493,13 @@ class MovieList extends StatelessWidget {
   }
 }
 
-
 /== presentation/pages/home_tv_series_page.dart
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:ditonton/common/constants.dart';
 import 'package:ditonton/domain/entities/tv_series.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_state.dart';
 import 'package:ditonton/presentation/pages/about_page.dart';
 import 'package:ditonton/presentation/pages/search_tv_series_page.dart';
 import 'package:ditonton/presentation/pages/tv_series_detail_page.dart';
@@ -2943,10 +4508,9 @@ import 'package:ditonton/presentation/pages/top_rated_tv_series_page.dart';
 import 'package:ditonton/presentation/pages/watchlist_tv_series_page.dart';
 import 'package:ditonton/presentation/pages/home_movie_page.dart';
 import 'package:ditonton/presentation/pages/now_playing_tv_series_page.dart';
-import 'package:ditonton/presentation/provider/tv_series_list_notifier.dart';
 import 'package:ditonton/common/state_enum.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class HomeTvSeriesPage extends StatefulWidget {
   static const ROUTE_NAME = '/home-tv-series';
@@ -2959,11 +4523,11 @@ class _HomeTvSeriesPageState extends State<HomeTvSeriesPage> {
   @override
   void initState() {
     super.initState();
-    Future.microtask(
-        () => Provider.of<TvSeriesListNotifier>(context, listen: false)
-          ..fetchNowPlayingTvSeries()
-          ..fetchPopularTvSeries()
-          ..fetchTopRatedTvSeries());
+    Future.microtask(() {
+      context.read<TvSeriesListBloc>().add(FetchNowPlayingTvSeries());
+      context.read<TvSeriesListBloc>().add(FetchPopularTvSeries());
+      context.read<TvSeriesListBloc>().add(FetchTopRatedTvSeries());
+    });
   }
 
   @override
@@ -3036,52 +4600,64 @@ class _HomeTvSeriesPageState extends State<HomeTvSeriesPage> {
                 onTap: () => Navigator.pushNamed(
                     context, NowPlayingTvSeriesPage.ROUTE_NAME),
               ),
-              Consumer<TvSeriesListNotifier>(builder: (context, data, child) {
-                final state = data.nowPlayingState;
-                if (state == RequestState.Loading) {
-                  return Center(
-                    child: CircularProgressIndicator(),
-                  );
-                } else if (state == RequestState.Loaded) {
-                  return TvSeriesList(data.nowPlayingTvSeries);
-                } else {
-                  return Text('Failed');
-                }
-              }),
+              BlocBuilder<TvSeriesListBloc, TvSeriesListState>(
+                builder: (context, state) {
+                  final nowPlayingState = state.nowPlayingState;
+                  if (nowPlayingState == RequestState.Loading) {
+                    return Center(
+                      child: CircularProgressIndicator(),
+                    );
+                  } else if (nowPlayingState == RequestState.Loaded) {
+                    return TvSeriesList(state.nowPlayingTvSeries);
+                  } else if (nowPlayingState == RequestState.Error) {
+                    return Text('Failed: ${state.message}');
+                  } else {
+                    return Container();
+                  }
+                },
+              ),
               _buildSubHeading(
                 title: 'Popular',
                 onTap: () => Navigator.pushNamed(
                     context, PopularTvSeriesPage.ROUTE_NAME),
               ),
-              Consumer<TvSeriesListNotifier>(builder: (context, data, child) {
-                final state = data.popularTvSeriesState;
-                if (state == RequestState.Loading) {
-                  return Center(
-                    child: CircularProgressIndicator(),
-                  );
-                } else if (state == RequestState.Loaded) {
-                  return TvSeriesList(data.popularTvSeries);
-                } else {
-                  return Text('Failed');
-                }
-              }),
+              BlocBuilder<TvSeriesListBloc, TvSeriesListState>(
+                builder: (context, state) {
+                  final popularTvSeriesState = state.popularTvSeriesState;
+                  if (popularTvSeriesState == RequestState.Loading) {
+                    return Center(
+                      child: CircularProgressIndicator(),
+                    );
+                  } else if (popularTvSeriesState == RequestState.Loaded) {
+                    return TvSeriesList(state.popularTvSeries);
+                  } else if (popularTvSeriesState == RequestState.Error) {
+                    return Text('Failed: ${state.message}');
+                  } else {
+                    return Container();
+                  }
+                },
+              ),
               _buildSubHeading(
                 title: 'Top Rated',
                 onTap: () => Navigator.pushNamed(
                     context, TopRatedTvSeriesPage.ROUTE_NAME),
               ),
-              Consumer<TvSeriesListNotifier>(builder: (context, data, child) {
-                final state = data.topRatedTvSeriesState;
-                if (state == RequestState.Loading) {
-                  return Center(
-                    child: CircularProgressIndicator(),
-                  );
-                } else if (state == RequestState.Loaded) {
-                  return TvSeriesList(data.topRatedTvSeries);
-                } else {
-                  return Text('Failed');
-                }
-              }),
+              BlocBuilder<TvSeriesListBloc, TvSeriesListState>(
+                builder: (context, state) {
+                  final topRatedTvSeriesState = state.topRatedTvSeriesState;
+                  if (topRatedTvSeriesState == RequestState.Loading) {
+                    return Center(
+                      child: CircularProgressIndicator(),
+                    );
+                  } else if (topRatedTvSeriesState == RequestState.Loaded) {
+                    return TvSeriesList(state.topRatedTvSeries);
+                  } else if (topRatedTvSeriesState == RequestState.Error) {
+                    return Text('Failed: ${state.message}');
+                  } else {
+                    return Container();
+                  }
+                },
+              ),
             ],
           ),
         ),
@@ -3153,18 +4729,19 @@ class TvSeriesList extends StatelessWidget {
   }
 }
 
-
 /== presentation/pages/movie_detail_page.dart
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:ditonton/common/constants.dart';
 import 'package:ditonton/domain/entities/genre.dart';
 import 'package:ditonton/domain/entities/movie.dart';
 import 'package:ditonton/domain/entities/movie_detail.dart';
-import 'package:ditonton/presentation/provider/movie_detail_notifier.dart';
+import 'package:ditonton/presentation/bloc/movie_detail/movie_detail_bloc.dart';
+import 'package:ditonton/presentation/bloc/movie_detail/movie_detail_event.dart';
+import 'package:ditonton/presentation/bloc/movie_detail/movie_detail_state.dart';
 import 'package:ditonton/common/state_enum.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_rating_bar/flutter_rating_bar.dart';
-import 'package:provider/provider.dart';
 
 class MovieDetailPage extends StatefulWidget {
   static const ROUTE_NAME = '/detail';
@@ -3181,33 +4758,33 @@ class _MovieDetailPageState extends State<MovieDetailPage> {
   void initState() {
     super.initState();
     Future.microtask(() {
-      Provider.of<MovieDetailNotifier>(context, listen: false)
-          .fetchMovieDetail(widget.id);
-      Provider.of<MovieDetailNotifier>(context, listen: false)
-          .loadWatchlistStatus(widget.id);
+      context.read<MovieDetailBloc>().add(FetchMovieDetail(widget.id));
+      context.read<MovieDetailBloc>().add(LoadWatchlistStatus(widget.id));
     });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Consumer<MovieDetailNotifier>(
-        builder: (context, provider, child) {
-          if (provider.movieState == RequestState.Loading) {
+      body: BlocBuilder<MovieDetailBloc, MovieDetailState>(
+        builder: (context, state) {
+          if (state.movieState == RequestState.Loading) {
             return Center(
               child: CircularProgressIndicator(),
             );
-          } else if (provider.movieState == RequestState.Loaded) {
-            final movie = provider.movie;
+          } else if (state.movieState == RequestState.Loaded) {
+            final movie = state.movieDetail!;
             return SafeArea(
               child: DetailContent(
                 movie,
-                provider.movieRecommendations,
-                provider.isAddedToWatchlist,
+                state.recommendations,
+                state.isAddedToWatchlist,
               ),
             );
+          } else if (state.movieState == RequestState.Error) {
+            return Text(state.message);
           } else {
-            return Text(provider.message);
+            return Container();
           }
         },
       ),
@@ -3265,44 +4842,31 @@ class DetailContent extends StatelessWidget {
                             FilledButton(
                               onPressed: () async {
                                 if (!isAddedWatchlist) {
-                                  await Provider.of<MovieDetailNotifier>(
-                                          context,
-                                          listen: false)
-                                      .addWatchlist(movie);
+                                  context.read<MovieDetailBloc>().add(
+                                      AddMovieToWatchlist(movie));
                                 } else {
-                                  await Provider.of<MovieDetailNotifier>(
-                                          context,
-                                          listen: false)
-                                      .removeFromWatchlist(movie);
+                                  context.read<MovieDetailBloc>().add(
+                                      RemoveMovieFromWatchlist(movie));
                                 }
 
-                                final message =
-                                    Provider.of<MovieDetailNotifier>(context,
-                                            listen: false)
-                                        .watchlistMessage;
+                                final state = context.read<MovieDetailBloc>().state;
+                                final message = state.watchlistMessage;
 
                                 if (message ==
-                                        MovieDetailNotifier
-                                            .watchlistAddSuccessMessage ||
+                                        MovieDetailBloc.watchlistAddSuccessMessage ||
                                     message ==
-                                        MovieDetailNotifier
-                                            .watchlistRemoveSuccessMessage) {
+                                        MovieDetailBloc.watchlistRemoveSuccessMessage) {
                                   ScaffoldMessenger.of(context).showSnackBar(
                                       SnackBar(content: Text(message)));
                                 } else {
-                                  showDialog(
-                                      context: context,
-                                      builder: (context) {
-                                        return AlertDialog(
-                                          content: Text(message),
-                                        );
-                                      });
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(content: Text(message)));
                                 }
                               },
                               child: Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  isAddedWatchlist
+                                  !isAddedWatchlist
                                       ? Icon(Icons.check)
                                       : Icon(Icons.add),
                                   Text('Watchlist'),
@@ -3342,17 +4906,17 @@ class DetailContent extends StatelessWidget {
                               'Recommendations',
                               style: kHeading6,
                             ),
-                            Consumer<MovieDetailNotifier>(
-                              builder: (context, data, child) {
-                                if (data.recommendationState ==
+                            BlocBuilder<MovieDetailBloc, MovieDetailState>(
+                              builder: (context, state) {
+                                if (state.recommendationState ==
                                     RequestState.Loading) {
                                   return Center(
                                     child: CircularProgressIndicator(),
                                   );
-                                } else if (data.recommendationState ==
+                                } else if (state.recommendationState ==
                                     RequestState.Error) {
-                                  return Text(data.message);
-                                } else if (data.recommendationState ==
+                                  return Text(state.message);
+                                } else if (state.recommendationState ==
                                     RequestState.Loaded) {
                                   return Container(
                                     height: 150,
@@ -3461,13 +5025,14 @@ class DetailContent extends StatelessWidget {
   }
 }
 
-
 /== presentation/pages/now_playing_tv_series_page.dart
 import 'package:ditonton/common/state_enum.dart';
-import 'package:ditonton/presentation/provider/tv_series_list_notifier.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_state.dart';
 import 'package:ditonton/presentation/widgets/tv_series_card_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class NowPlayingTvSeriesPage extends StatefulWidget {
   static const ROUTE_NAME = '/now-playing-tv-series';
@@ -3481,8 +5046,7 @@ class _NowPlayingTvSeriesPageState extends State<NowPlayingTvSeriesPage> {
   void initState() {
     super.initState();
     Future.microtask(() =>
-        Provider.of<TvSeriesListNotifier>(context, listen: false)
-            .fetchNowPlayingTvSeries());
+        context.read<TvSeriesListBloc>().add(FetchNowPlayingTvSeries()));
   }
 
   @override
@@ -3493,25 +5057,27 @@ class _NowPlayingTvSeriesPageState extends State<NowPlayingTvSeriesPage> {
       ),
       body: Padding(
         padding: const EdgeInsets.all(8.0),
-        child: Consumer<TvSeriesListNotifier>(
-          builder: (context, data, child) {
-            if (data.nowPlayingState == RequestState.Loading) {
+        child: BlocBuilder<TvSeriesListBloc, TvSeriesListState>(
+          builder: (context, state) {
+            if (state.nowPlayingState == RequestState.Loading) {
               return Center(
                 child: CircularProgressIndicator(),
               );
-            } else if (data.nowPlayingState == RequestState.Loaded) {
+            } else if (state.nowPlayingState == RequestState.Loaded) {
               return ListView.builder(
                 itemBuilder: (context, index) {
-                  final series = data.nowPlayingTvSeries[index];
+                  final series = state.nowPlayingTvSeries[index];
                   return TvSeriesCard(series);
                 },
-                itemCount: data.nowPlayingTvSeries.length,
+                itemCount: state.nowPlayingTvSeries.length,
               );
-            } else {
+            } else if (state.nowPlayingState == RequestState.Error) {
               return Center(
                 key: Key('error_message'),
-                child: Text(data.message),
+                child: Text(state.message),
               );
+            } else {
+              return Container();
             }
           },
         ),
@@ -3522,10 +5088,12 @@ class _NowPlayingTvSeriesPageState extends State<NowPlayingTvSeriesPage> {
 
 /== presentation/pages/popular_movies_page.dart
 import 'package:ditonton/common/state_enum.dart';
-import 'package:ditonton/presentation/provider/popular_movies_notifier.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_event.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_state.dart';
 import 'package:ditonton/presentation/widgets/movie_card_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class PopularMoviesPage extends StatefulWidget {
   static const ROUTE_NAME = '/popular-movie';
@@ -3539,8 +5107,7 @@ class _PopularMoviesPageState extends State<PopularMoviesPage> {
   void initState() {
     super.initState();
     Future.microtask(() =>
-        Provider.of<PopularMoviesNotifier>(context, listen: false)
-            .fetchPopularMovies());
+        context.read<MovieListBloc>().add(FetchPopularMovies()));
   }
 
   @override
@@ -3551,25 +5118,27 @@ class _PopularMoviesPageState extends State<PopularMoviesPage> {
       ),
       body: Padding(
         padding: const EdgeInsets.all(8.0),
-        child: Consumer<PopularMoviesNotifier>(
-          builder: (context, data, child) {
-            if (data.state == RequestState.Loading) {
+        child: BlocBuilder<MovieListBloc, MovieListState>(
+          builder: (context, state) {
+            if (state.popularMoviesState == RequestState.Loading) {
               return Center(
                 child: CircularProgressIndicator(),
               );
-            } else if (data.state == RequestState.Loaded) {
+            } else if (state.popularMoviesState == RequestState.Loaded) {
               return ListView.builder(
                 itemBuilder: (context, index) {
-                  final movie = data.movies[index];
+                  final movie = state.popularMovies[index];
                   return MovieCard(movie);
                 },
-                itemCount: data.movies.length,
+                itemCount: state.popularMovies.length,
               );
-            } else {
+            } else if (state.popularMoviesState == RequestState.Error) {
               return Center(
                 key: Key('error_message'),
-                child: Text(data.message),
+                child: Text(state.message),
               );
+            } else {
+              return Container();
             }
           },
         ),
@@ -3578,13 +5147,14 @@ class _PopularMoviesPageState extends State<PopularMoviesPage> {
   }
 }
 
-
 /== presentation/pages/popular_tv_series_page.dart
 import 'package:ditonton/common/state_enum.dart';
-import 'package:ditonton/presentation/provider/popular_tv_series_notifier.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_state.dart';
 import 'package:ditonton/presentation/widgets/tv_series_card_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class PopularTvSeriesPage extends StatefulWidget {
   static const ROUTE_NAME = '/popular-tv-series';
@@ -3598,8 +5168,7 @@ class _PopularTvSeriesPageState extends State<PopularTvSeriesPage> {
   void initState() {
     super.initState();
     Future.microtask(() =>
-        Provider.of<PopularTvSeriesNotifier>(context, listen: false)
-            .fetchPopularTvSeries());
+        context.read<TvSeriesListBloc>().add(FetchPopularTvSeries()));
   }
 
   @override
@@ -3610,25 +5179,27 @@ class _PopularTvSeriesPageState extends State<PopularTvSeriesPage> {
       ),
       body: Padding(
         padding: const EdgeInsets.all(8.0),
-        child: Consumer<PopularTvSeriesNotifier>(
-          builder: (context, data, child) {
-            if (data.state == RequestState.Loading) {
+        child: BlocBuilder<TvSeriesListBloc, TvSeriesListState>(
+          builder: (context, state) {
+            if (state.popularTvSeriesState == RequestState.Loading) {
               return Center(
                 child: CircularProgressIndicator(),
               );
-            } else if (data.state == RequestState.Loaded) {
+            } else if (state.popularTvSeriesState == RequestState.Loaded) {
               return ListView.builder(
                 itemBuilder: (context, index) {
-                  final series = data.tvSeries[index];
+                  final series = state.popularTvSeries[index];
                   return TvSeriesCard(series);
                 },
-                itemCount: data.tvSeries.length,
+                itemCount: state.popularTvSeries.length,
               );
-            } else {
+            } else if (state.popularTvSeriesState == RequestState.Error) {
               return Center(
                 key: Key('error_message'),
-                child: Text(data.message),
+                child: Text(state.message),
               );
+            } else {
+              return Container();
             }
           },
         ),
@@ -3637,14 +5208,15 @@ class _PopularTvSeriesPageState extends State<PopularTvSeriesPage> {
   }
 }
 
-
 /== presentation/pages/search_page.dart
 import 'package:ditonton/common/constants.dart';
 import 'package:ditonton/common/state_enum.dart';
-import 'package:ditonton/presentation/provider/movie_search_notifier.dart';
+import 'package:ditonton/presentation/bloc/movie_search/movie_search_bloc.dart';
+import 'package:ditonton/presentation/bloc/movie_search/movie_search_event.dart';
+import 'package:ditonton/presentation/bloc/movie_search/movie_search_state.dart';
 import 'package:ditonton/presentation/widgets/movie_card_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class SearchPage extends StatelessWidget {
   static const ROUTE_NAME = '/search';
@@ -3662,8 +5234,7 @@ class SearchPage extends StatelessWidget {
           children: [
             TextField(
               onSubmitted: (query) {
-                Provider.of<MovieSearchNotifier>(context, listen: false)
-                    .fetchMovieSearch(query);
+                context.read<MovieSearchBloc>().add(QueryChanged(query));
               },
               decoration: InputDecoration(
                 hintText: 'Search title',
@@ -3677,22 +5248,28 @@ class SearchPage extends StatelessWidget {
               'Search Result',
               style: kHeading6,
             ),
-            Consumer<MovieSearchNotifier>(
-              builder: (context, data, child) {
-                if (data.state == RequestState.Loading) {
+            BlocBuilder<MovieSearchBloc, MovieSearchState>(
+              builder: (context, state) {
+                if (state.state == RequestState.Loading) {
                   return Center(
                     child: CircularProgressIndicator(),
                   );
-                } else if (data.state == RequestState.Loaded) {
-                  final result = data.searchResult;
+                } else if (state.state == RequestState.Loaded) {
+                  final result = state.searchResult;
                   return Expanded(
                     child: ListView.builder(
                       padding: const EdgeInsets.all(8),
                       itemBuilder: (context, index) {
-                        final movie = data.searchResult[index];
+                        final movie = state.searchResult[index];
                         return MovieCard(movie);
                       },
                       itemCount: result.length,
+                    ),
+                  );
+                } else if (state.state == RequestState.Error) {
+                  return Expanded(
+                    child: Center(
+                      child: Text(state.message),
                     ),
                   );
                 } else {
@@ -3709,14 +5286,15 @@ class SearchPage extends StatelessWidget {
   }
 }
 
-
 /== presentation/pages/search_tv_series_page.dart
 import 'package:ditonton/common/constants.dart';
 import 'package:ditonton/common/state_enum.dart';
-import 'package:ditonton/presentation/provider/tv_series_search_notifier.dart';
+import 'package:ditonton/presentation/bloc/tv_series_search/tv_series_search_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_search/tv_series_search_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_search/tv_series_search_state.dart';
 import 'package:ditonton/presentation/widgets/tv_series_card_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class SearchTvSeriesPage extends StatelessWidget {
   static const ROUTE_NAME = '/search-tv-series';
@@ -3734,8 +5312,7 @@ class SearchTvSeriesPage extends StatelessWidget {
           children: [
             TextField(
               onSubmitted: (query) {
-                Provider.of<TvSeriesSearchNotifier>(context, listen: false)
-                    .fetchTvSeriesSearch(query);
+                context.read<TvSeriesSearchBloc>().add(QueryChanged(query));
               },
               decoration: InputDecoration(
                 hintText: 'Search title',
@@ -3749,22 +5326,28 @@ class SearchTvSeriesPage extends StatelessWidget {
               'Search Result',
               style: kHeading6,
             ),
-            Consumer<TvSeriesSearchNotifier>(
-              builder: (context, data, child) {
-                if (data.state == RequestState.Loading) {
+            BlocBuilder<TvSeriesSearchBloc, TvSeriesSearchState>(
+              builder: (context, state) {
+                if (state.state == RequestState.Loading) {
                   return Center(
                     child: CircularProgressIndicator(),
                   );
-                } else if (data.state == RequestState.Loaded) {
-                  final result = data.searchResult;
+                } else if (state.state == RequestState.Loaded) {
+                  final result = state.searchResult;
                   return Expanded(
                     child: ListView.builder(
                       padding: const EdgeInsets.all(8),
                       itemBuilder: (context, index) {
-                        final series = data.searchResult[index];
+                        final series = state.searchResult[index];
                         return TvSeriesCard(series);
                       },
                       itemCount: result.length,
+                    ),
+                  );
+                } else if (state.state == RequestState.Error) {
+                  return Expanded(
+                    child: Center(
+                      child: Text(state.message),
                     ),
                   );
                 } else {
@@ -3783,10 +5366,12 @@ class SearchTvSeriesPage extends StatelessWidget {
 
 /== presentation/pages/top_rated_movies_page.dart
 import 'package:ditonton/common/state_enum.dart';
-import 'package:ditonton/presentation/provider/top_rated_movies_notifier.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_event.dart';
+import 'package:ditonton/presentation/bloc/movie_list/movie_list_state.dart';
 import 'package:ditonton/presentation/widgets/movie_card_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class TopRatedMoviesPage extends StatefulWidget {
   static const ROUTE_NAME = '/top-rated-movie';
@@ -3800,8 +5385,7 @@ class _TopRatedMoviesPageState extends State<TopRatedMoviesPage> {
   void initState() {
     super.initState();
     Future.microtask(() =>
-        Provider.of<TopRatedMoviesNotifier>(context, listen: false)
-            .fetchTopRatedMovies());
+        context.read<MovieListBloc>().add(FetchTopRatedMovies()));
   }
 
   @override
@@ -3812,25 +5396,27 @@ class _TopRatedMoviesPageState extends State<TopRatedMoviesPage> {
       ),
       body: Padding(
         padding: const EdgeInsets.all(8.0),
-        child: Consumer<TopRatedMoviesNotifier>(
-          builder: (context, data, child) {
-            if (data.state == RequestState.Loading) {
+        child: BlocBuilder<MovieListBloc, MovieListState>(
+          builder: (context, state) {
+            if (state.topRatedMoviesState == RequestState.Loading) {
               return Center(
                 child: CircularProgressIndicator(),
               );
-            } else if (data.state == RequestState.Loaded) {
+            } else if (state.topRatedMoviesState == RequestState.Loaded) {
               return ListView.builder(
                 itemBuilder: (context, index) {
-                  final movie = data.movies[index];
+                  final movie = state.topRatedMovies[index];
                   return MovieCard(movie);
                 },
-                itemCount: data.movies.length,
+                itemCount: state.topRatedMovies.length,
               );
-            } else {
+            } else if (state.topRatedMoviesState == RequestState.Error) {
               return Center(
                 key: Key('error_message'),
-                child: Text(data.message),
+                child: Text(state.message),
               );
+            } else {
+              return Container();
             }
           },
         ),
@@ -3839,13 +5425,14 @@ class _TopRatedMoviesPageState extends State<TopRatedMoviesPage> {
   }
 }
 
-
 /== presentation/pages/top_rated_tv_series_page.dart
 import 'package:ditonton/common/state_enum.dart';
-import 'package:ditonton/presentation/provider/top_rated_tv_series_notifier.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_state.dart';
 import 'package:ditonton/presentation/widgets/tv_series_card_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class TopRatedTvSeriesPage extends StatefulWidget {
   static const ROUTE_NAME = '/top-rated-tv-series';
@@ -3859,8 +5446,7 @@ class _TopRatedTvSeriesPageState extends State<TopRatedTvSeriesPage> {
   void initState() {
     super.initState();
     Future.microtask(() =>
-        Provider.of<TopRatedTvSeriesNotifier>(context, listen: false)
-            .fetchTopRatedTvSeries());
+        context.read<TvSeriesListBloc>().add(FetchTopRatedTvSeries()));
   }
 
   @override
@@ -3871,25 +5457,27 @@ class _TopRatedTvSeriesPageState extends State<TopRatedTvSeriesPage> {
       ),
       body: Padding(
         padding: const EdgeInsets.all(8.0),
-        child: Consumer<TopRatedTvSeriesNotifier>(
-          builder: (context, data, child) {
-            if (data.state == RequestState.Loading) {
+        child: BlocBuilder<TvSeriesListBloc, TvSeriesListState>(
+          builder: (context, state) {
+            if (state.topRatedTvSeriesState == RequestState.Loading) {
               return Center(
                 child: CircularProgressIndicator(),
               );
-            } else if (data.state == RequestState.Loaded) {
+            } else if (state.topRatedTvSeriesState == RequestState.Loaded) {
               return ListView.builder(
                 itemBuilder: (context, index) {
-                  final series = data.tvSeries[index];
+                  final series = state.topRatedTvSeries[index];
                   return TvSeriesCard(series);
                 },
-                itemCount: data.tvSeries.length,
+                itemCount: state.topRatedTvSeries.length,
               );
-            } else {
+            } else if (state.topRatedTvSeriesState == RequestState.Error) {
               return Center(
                 key: Key('error_message'),
-                child: Text(data.message),
+                child: Text(state.message),
               );
+            } else {
+              return Container();
             }
           },
         ),
@@ -3898,18 +5486,19 @@ class _TopRatedTvSeriesPageState extends State<TopRatedTvSeriesPage> {
   }
 }
 
-
 /== presentation/pages/tv_series_detail_page.dart
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:ditonton/common/constants.dart';
 import 'package:ditonton/domain/entities/genre.dart';
 import 'package:ditonton/domain/entities/tv_series.dart';
 import 'package:ditonton/domain/entities/tv_series_detail.dart';
-import 'package:ditonton/presentation/provider/tv_series_detail_notifier.dart';
+import 'package:ditonton/presentation/bloc/tv_series_detail/tv_series_detail_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_detail/tv_series_detail_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_detail/tv_series_detail_state.dart';
 import 'package:ditonton/common/state_enum.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_rating_bar/flutter_rating_bar.dart';
-import 'package:provider/provider.dart';
 
 class TvSeriesDetailPage extends StatefulWidget {
   static const ROUTE_NAME = '/tv-series-detail';
@@ -3926,33 +5515,33 @@ class _TvSeriesDetailPageState extends State<TvSeriesDetailPage> {
   void initState() {
     super.initState();
     Future.microtask(() {
-      Provider.of<TvSeriesDetailNotifier>(context, listen: false)
-          .fetchTvSeriesDetail(widget.id);
-      Provider.of<TvSeriesDetailNotifier>(context, listen: false)
-          .loadWatchlistStatus(widget.id);
+      context.read<TvSeriesDetailBloc>().add(FetchTvSeriesDetail(widget.id));
+      context.read<TvSeriesDetailBloc>().add(LoadTvSeriesWatchlistStatus(widget.id));
     });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Consumer<TvSeriesDetailNotifier>(
-        builder: (context, provider, child) {
-          if (provider.tvSeriesState == RequestState.Loading) {
+      body: BlocBuilder<TvSeriesDetailBloc, TvSeriesDetailState>(
+        builder: (context, state) {
+          if (state.tvSeriesState == RequestState.Loading) {
             return Center(
               child: CircularProgressIndicator(),
             );
-          } else if (provider.tvSeriesState == RequestState.Loaded) {
-            final series = provider.tvSeries;
+          } else if (state.tvSeriesState == RequestState.Loaded) {
+            final series = state.tvSeriesDetail!;
             return SafeArea(
               child: DetailContent(
                 series,
-                provider.tvSeriesRecommendations,
-                provider.isAddedToWatchlist,
+                state.recommendations,
+                state.isAddedToWatchlist,
               ),
             );
+          } else if (state.tvSeriesState == RequestState.Error) {
+            return Text(state.message);
           } else {
-            return Text(provider.message);
+            return Container();
           }
         },
       ),
@@ -3966,11 +5555,6 @@ class DetailContent extends StatelessWidget {
   final bool isAddedWatchlist;
 
   DetailContent(this.series, this.recommendations, this.isAddedWatchlist);
-
-  // String _showGenres(List<Genre> genres) {
-  //   if (genres.isEmpty) return '';
-  //   return genres.map((genre) => genre.name).join(', ');
-  // }
 
   @override
   Widget build(BuildContext context) {
@@ -4025,46 +5609,33 @@ class DetailContent extends StatelessWidget {
                                   ),
                                   onPressed: () async {
                                     if (!isAddedWatchlist) {
-                                      await Provider.of<TvSeriesDetailNotifier>(
-                                        context,
-                                        listen: false,
-                                      ).addWatchlist(series);
+                                      context.read<TvSeriesDetailBloc>().add(
+                                          AddTvSeriesToWatchlist(series));
                                     } else {
-                                      await Provider.of<TvSeriesDetailNotifier>(
-                                        context,
-                                        listen: false,
-                                      ).removeFromWatchlist(series);
+                                      context.read<TvSeriesDetailBloc>().add(
+                                          RemoveTvSeriesFromWatchlist(series));
                                     }
 
-                                    final message =
-                                        Provider.of<TvSeriesDetailNotifier>(
-                                                context,
-                                                listen: false)
-                                            .watchlistMessage;
-
+                                    final state = context.read<TvSeriesDetailBloc>().state;
+                                    final message = state.watchlistMessage;
+                                    print(message);
                                     if (message ==
-                                            TvSeriesDetailNotifier
-                                                .watchlistAddSuccessMessage ||
+                                            TvSeriesDetailBloc.watchlistAddSuccessMessage ||
                                         message ==
-                                            TvSeriesDetailNotifier
-                                                .watchlistRemoveSuccessMessage) {
+                                            TvSeriesDetailBloc.watchlistRemoveSuccessMessage) {
                                       ScaffoldMessenger.of(context)
                                           .showSnackBar(
                                               SnackBar(content: Text(message)));
                                     } else {
-                                      showDialog(
-                                          context: context,
-                                          builder: (context) {
-                                            return AlertDialog(
-                                              content: Text(message),
-                                            );
-                                          });
+                                      ScaffoldMessenger.of(context)
+                                          .showSnackBar(
+                                          SnackBar(content: Text(message)));
                                     }
                                   },
                                   child: Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
-                                      isAddedWatchlist
+                                      !isAddedWatchlist
                                           ? Icon(Icons.check,
                                               color: Colors.black)
                                           : Icon(Icons.add,
@@ -4107,44 +5678,61 @@ class DetailContent extends StatelessWidget {
                                   style:
                                       kHeading6.copyWith(color: Colors.white),
                                 ),
-                                Container(
-                                  height: 150,
-                                  child: ListView.builder(
-                                    scrollDirection: Axis.horizontal,
-                                    itemBuilder: (context, index) {
-                                      final series = recommendations[index];
-                                      return Padding(
-                                        padding: const EdgeInsets.all(4.0),
-                                        child: InkWell(
-                                          onTap: () {
-                                            Navigator.pushReplacementNamed(
-                                              context,
-                                              TvSeriesDetailPage.ROUTE_NAME,
-                                              arguments: series.id,
+                                BlocBuilder<TvSeriesDetailBloc, TvSeriesDetailState>(
+                                  builder: (context, state) {
+                                    if (state.recommendationState ==
+                                        RequestState.Loading) {
+                                      return Center(
+                                        child: CircularProgressIndicator(),
+                                      );
+                                    } else if (state.recommendationState ==
+                                        RequestState.Error) {
+                                      return Text(state.message);
+                                    } else if (state.recommendationState ==
+                                        RequestState.Loaded) {
+                                      return Container(
+                                        height: 150,
+                                        child: ListView.builder(
+                                          scrollDirection: Axis.horizontal,
+                                          itemBuilder: (context, index) {
+                                            final series = recommendations[index];
+                                            return Padding(
+                                              padding: const EdgeInsets.all(4.0),
+                                              child: InkWell(
+                                                onTap: () {
+                                                  Navigator.pushReplacementNamed(
+                                                    context,
+                                                    TvSeriesDetailPage.ROUTE_NAME,
+                                                    arguments: series.id,
+                                                  );
+                                                },
+                                                child: ClipRRect(
+                                                  borderRadius: BorderRadius.all(
+                                                    Radius.circular(8),
+                                                  ),
+                                                  child: CachedNetworkImage(
+                                                    imageUrl:
+                                                        '$BASE_IMAGE_URL${series.posterPath}',
+                                                    placeholder: (context, url) =>
+                                                        Center(
+                                                      child:
+                                                          CircularProgressIndicator(),
+                                                    ),
+                                                    errorWidget:
+                                                        (context, url, error) =>
+                                                            Icon(Icons.error),
+                                                  ),
+                                                ),
+                                              ),
                                             );
                                           },
-                                          child: ClipRRect(
-                                            borderRadius: BorderRadius.all(
-                                              Radius.circular(8),
-                                            ),
-                                            child: CachedNetworkImage(
-                                              imageUrl:
-                                                  '$BASE_IMAGE_URL${series.posterPath}',
-                                              placeholder: (context, url) =>
-                                                  Center(
-                                                child:
-                                                    CircularProgressIndicator(),
-                                              ),
-                                              errorWidget:
-                                                  (context, url, error) =>
-                                                      Icon(Icons.error),
-                                            ),
-                                          ),
+                                          itemCount: recommendations.length,
                                         ),
                                       );
-                                    },
-                                    itemCount: recommendations.length,
-                                  ),
+                                    } else {
+                                      return Container();
+                                    }
+                                  },
                                 ),
                               ],
                             ),
@@ -4197,13 +5785,14 @@ class DetailContent extends StatelessWidget {
   }
 }
 
-
 /== presentation/pages/tv_series_page.dart
 import 'package:ditonton/common/state_enum.dart';
-import 'package:ditonton/presentation/provider/tv_series_list_notifier.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_bloc.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_event.dart';
+import 'package:ditonton/presentation/bloc/tv_series_list/tv_series_list_state.dart';
 import 'package:ditonton/presentation/widgets/tv_series_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class TvSeriesPage extends StatefulWidget {
   static const ROUTE_NAME = '/tv-series';
@@ -4217,10 +5806,9 @@ class _TvSeriesPageState extends State<TvSeriesPage> {
   void initState() {
     super.initState();
     Future.microtask(() {
-      Provider.of<TvSeriesListNotifier>(context, listen: false)
-        ..fetchNowPlayingTvSeries()
-        ..fetchPopularTvSeries()
-        ..fetchTopRatedTvSeries();
+      context.read<TvSeriesListBloc>().add(FetchNowPlayingTvSeries());
+      context.read<TvSeriesListBloc>().add(FetchPopularTvSeries());
+      context.read<TvSeriesListBloc>().add(FetchTopRatedTvSeries());
     });
   }
 
@@ -4240,18 +5828,18 @@ class _TvSeriesPageState extends State<TvSeriesPage> {
                 'Now Playing',
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
               ),
-              Consumer<TvSeriesListNotifier>(
-                builder: (context, data, child) {
-                  final state = data.nowPlayingState;
-                  if (state == RequestState.Loading) {
+              BlocBuilder<TvSeriesListBloc, TvSeriesListState>(
+                builder: (context, state) {
+                  final nowPlayingState = state.nowPlayingState;
+                  if (nowPlayingState == RequestState.Loading) {
                     return Center(
                       child: CircularProgressIndicator(),
                     );
-                  } else if (state == RequestState.Loaded) {
-                    return TvSeriesList(data.nowPlayingTvSeries);
-                  } else if (state == RequestState.Error) {
+                  } else if (nowPlayingState == RequestState.Loaded) {
+                    return TvSeriesList(state.nowPlayingTvSeries);
+                  } else if (nowPlayingState == RequestState.Error) {
                     return Center(
-                      child: Text(data.message),
+                      child: Text(state.message),
                     );
                   } else {
                     return Container();
@@ -4263,18 +5851,18 @@ class _TvSeriesPageState extends State<TvSeriesPage> {
                 'Popular',
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
               ),
-              Consumer<TvSeriesListNotifier>(
-                builder: (context, data, child) {
-                  final state = data.popularTvSeriesState;
-                  if (state == RequestState.Loading) {
+              BlocBuilder<TvSeriesListBloc, TvSeriesListState>(
+                builder: (context, state) {
+                  final popularTvSeriesState = state.popularTvSeriesState;
+                  if (popularTvSeriesState == RequestState.Loading) {
                     return Center(
                       child: CircularProgressIndicator(),
                     );
-                  } else if (state == RequestState.Loaded) {
-                    return TvSeriesList(data.popularTvSeries);
-                  } else if (state == RequestState.Error) {
+                  } else if (popularTvSeriesState == RequestState.Loaded) {
+                    return TvSeriesList(state.popularTvSeries);
+                  } else if (popularTvSeriesState == RequestState.Error) {
                     return Center(
-                      child: Text(data.message),
+                      child: Text(state.message),
                     );
                   } else {
                     return Container();
@@ -4286,18 +5874,18 @@ class _TvSeriesPageState extends State<TvSeriesPage> {
                 'Top Rated',
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
               ),
-              Consumer<TvSeriesListNotifier>(
-                builder: (context, data, child) {
-                  final state = data.topRatedTvSeriesState;
-                  if (state == RequestState.Loading) {
+              BlocBuilder<TvSeriesListBloc, TvSeriesListState>(
+                builder: (context, state) {
+                  final topRatedTvSeriesState = state.topRatedTvSeriesState;
+                  if (topRatedTvSeriesState == RequestState.Loading) {
                     return Center(
                       child: CircularProgressIndicator(),
                     );
-                  } else if (state == RequestState.Loaded) {
-                    return TvSeriesList(data.topRatedTvSeries);
-                  } else if (state == RequestState.Error) {
+                  } else if (topRatedTvSeriesState == RequestState.Loaded) {
+                    return TvSeriesList(state.topRatedTvSeries);
+                  } else if (topRatedTvSeriesState == RequestState.Error) {
                     return Center(
-                      child: Text(data.message),
+                      child: Text(state.message),
                     );
                   } else {
                     return Container();
@@ -4312,14 +5900,15 @@ class _TvSeriesPageState extends State<TvSeriesPage> {
   }
 }
 
-
 /== presentation/pages/watchlist_movies_page.dart
 import 'package:ditonton/common/state_enum.dart';
 import 'package:ditonton/common/utils.dart';
-import 'package:ditonton/presentation/provider/watchlist_movie_notifier.dart';
+import 'package:ditonton/presentation/bloc/watchlist_movie/watchlist_movie_bloc.dart';
+import 'package:ditonton/presentation/bloc/watchlist_movie/watchlist_movie_event.dart';
+import 'package:ditonton/presentation/bloc/watchlist_movie/watchlist_movie_state.dart';
 import 'package:ditonton/presentation/widgets/movie_card_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class WatchlistMoviesPage extends StatefulWidget {
   static const ROUTE_NAME = '/watchlist-movie';
@@ -4333,9 +5922,9 @@ class _WatchlistMoviesPageState extends State<WatchlistMoviesPage>
   @override
   void initState() {
     super.initState();
-    Future.microtask(() =>
-        Provider.of<WatchlistMovieNotifier>(context, listen: false)
-            .fetchWatchlistMovies());
+    Future.microtask(() {
+      context.read<WatchlistMovieBloc>().add(FetchWatchlistMovies());
+    });
   }
 
   @override
@@ -4345,8 +5934,7 @@ class _WatchlistMoviesPageState extends State<WatchlistMoviesPage>
   }
 
   void didPopNext() {
-    Provider.of<WatchlistMovieNotifier>(context, listen: false)
-        .fetchWatchlistMovies();
+    context.read<WatchlistMovieBloc>().add(FetchWatchlistMovies());
   }
 
   @override
@@ -4357,25 +5945,27 @@ class _WatchlistMoviesPageState extends State<WatchlistMoviesPage>
       ),
       body: Padding(
         padding: const EdgeInsets.all(8.0),
-        child: Consumer<WatchlistMovieNotifier>(
-          builder: (context, data, child) {
-            if (data.watchlistState == RequestState.Loading) {
+        child: BlocBuilder<WatchlistMovieBloc, WatchlistMovieState>(
+          builder: (context, state) {
+            if (state.watchlistState == RequestState.Loading) {
               return Center(
                 child: CircularProgressIndicator(),
               );
-            } else if (data.watchlistState == RequestState.Loaded) {
+            } else if (state.watchlistState == RequestState.Loaded) {
               return ListView.builder(
                 itemBuilder: (context, index) {
-                  final movie = data.watchlistMovies[index];
+                  final movie = state.watchlistMovies[index];
                   return MovieCard(movie);
                 },
-                itemCount: data.watchlistMovies.length,
+                itemCount: state.watchlistMovies.length,
               );
-            } else {
+            } else if (state.watchlistState == RequestState.Error) {
               return Center(
                 key: Key('error_message'),
-                child: Text(data.message),
+                child: Text(state.message),
               );
+            } else {
+              return Container();
             }
           },
         ),
@@ -4390,14 +5980,15 @@ class _WatchlistMoviesPageState extends State<WatchlistMoviesPage>
   }
 }
 
-
 /== presentation/pages/watchlist_tv_series_page.dart
 import 'package:ditonton/common/state_enum.dart';
 import 'package:ditonton/common/utils.dart';
-import 'package:ditonton/presentation/provider/watchlist_tv_series_notifier.dart';
+import 'package:ditonton/presentation/bloc/watchlist_tv_series/watchlist_tv_series_bloc.dart';
+import 'package:ditonton/presentation/bloc/watchlist_tv_series/watchlist_tv_series_event.dart';
+import 'package:ditonton/presentation/bloc/watchlist_tv_series/watchlist_tv_series_state.dart';
 import 'package:ditonton/presentation/widgets/tv_series_card_list.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
 
 class WatchlistTvSeriesPage extends StatefulWidget {
   static const ROUTE_NAME = '/watchlist-tv-series';
@@ -4411,9 +6002,9 @@ class _WatchlistTvSeriesPageState extends State<WatchlistTvSeriesPage>
   @override
   void initState() {
     super.initState();
-    Future.microtask(() =>
-        Provider.of<WatchlistTvSeriesNotifier>(context, listen: false)
-            .fetchWatchlistTvSeries());
+    Future.microtask(() {
+      context.read<WatchlistTvSeriesBloc>().add(FetchWatchlistTvSeries());
+    });
   }
 
   @override
@@ -4423,8 +6014,7 @@ class _WatchlistTvSeriesPageState extends State<WatchlistTvSeriesPage>
   }
 
   void didPopNext() {
-    Provider.of<WatchlistTvSeriesNotifier>(context, listen: false)
-        .fetchWatchlistTvSeries();
+    context.read<WatchlistTvSeriesBloc>().add(FetchWatchlistTvSeries());
   }
 
   @override
@@ -4435,25 +6025,27 @@ class _WatchlistTvSeriesPageState extends State<WatchlistTvSeriesPage>
       ),
       body: Padding(
         padding: const EdgeInsets.all(8.0),
-        child: Consumer<WatchlistTvSeriesNotifier>(
-          builder: (context, data, child) {
-            if (data.watchlistState == RequestState.Loading) {
+        child: BlocBuilder<WatchlistTvSeriesBloc, WatchlistTvSeriesState>(
+          builder: (context, state) {
+            if (state.watchlistState == RequestState.Loading) {
               return Center(
                 child: CircularProgressIndicator(),
               );
-            } else if (data.watchlistState == RequestState.Loaded) {
+            } else if (state.watchlistState == RequestState.Loaded) {
               return ListView.builder(
                 itemBuilder: (context, index) {
-                  final series = data.watchlistTvSeries[index];
+                  final series = state.watchlistTvSeries[index];
                   return TvSeriesCard(series);
                 },
-                itemCount: data.watchlistTvSeries.length,
+                itemCount: state.watchlistTvSeries.length,
               );
-            } else {
+            } else if (state.watchlistState == RequestState.Error) {
               return Center(
                 key: Key('error_message'),
-                child: Text(data.message),
+                child: Text(state.message),
               );
+            } else {
+              return Container();
             }
           },
         ),
@@ -4467,7 +6059,6 @@ class _WatchlistTvSeriesPageState extends State<WatchlistTvSeriesPage>
     super.dispose();
   }
 }
-
 
 /== presentation/provider/movie_detail_notifier.dart
 import 'package:ditonton/domain/entities/movie.dart';
