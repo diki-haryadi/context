@@ -88,37 +88,62 @@ curl -s "https://api.rawg.io/api/games/3498?key=fe9d7ddef6394a068e8f6aa7675aacd6
 //  ContentView.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 22/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
 
 struct ContentView: View {
-  @EnvironmentObject var homePresenter: HomePresenter
-  @EnvironmentObject var favoritePresenter: FavoritePresenter
-  @EnvironmentObject var searchPresenter: SearchPresenter
-
+  
+  @EnvironmentObject var appState: AppState
+  
   var body: some View {
     TabView {
-      NavigationStack {
-        HomeView(presenter: homePresenter)
-      }.tabItem {
-        TabItem(imageName: "house", title: "Home")
+      NavigationView {
+        HomeView(
+          presenter: HomePresenter(
+            homeUseCase: Injection.init().provideHome()
+          )
+        )
       }
-
-      NavigationStack {
-        SearchView(presenter: searchPresenter)
-      }.tabItem {
-        TabItem(imageName: "magnifyingglass", title: "Search")
+      .tabItem {
+        Image(systemName: "gamecontroller")
+        Text("Games")
       }
-
-      NavigationStack {
-        FavoriteView(presenter: favoritePresenter)
-      }.tabItem {
-        TabItem(imageName: "heart", title: "Favorite")
+      
+      NavigationView {
+        SearchView(
+          presenter: SearchPresenter(
+            searchUseCase: Injection.init().provideSearch()
+          )
+        )
+      }
+      .tabItem {
+        Image(systemName: "magnifyingglass")
+        Text("Search")
+      }
+      
+      NavigationView {
+        FavoriteView(
+          presenter: FavoritePresenter(
+            favoriteUseCase: Injection.init().provideFavorite()
+          )
+        )
+      }
+      .tabItem {
+        Image(systemName: "heart")
+        Text("Favorites")
       }
     }
+    .accentColor(.red)
   }
+}
+
+class AppState: ObservableObject {
+  @Published var selectedTab: Int = 0
+  @Published var needsRefreshFavorites: Bool = false
+  
+  static let shared = AppState()
 }
 
 
@@ -192,7 +217,7 @@ struct TheMealsAppApp: App {
 {
   "images" : [
     {
-      "filename" : "salad.pdf",
+      "filename" : "5118aff5091cb3efec399c808f8c598f.jpg",
       "idiom" : "universal",
       "scale" : "1x"
     },
@@ -216,7 +241,7 @@ struct TheMealsAppApp: App {
 {
   "images" : [
     {
-      "filename" : "search_meal.png",
+      "filename" : "5118aff5091cb3efec399c808f8c598f.jpg",
       "idiom" : "universal",
       "scale" : "1x"
     },
@@ -240,7 +265,7 @@ struct TheMealsAppApp: App {
 {
   "images" : [
     {
-      "filename" : "drinking-table.pdf",
+      "filename" : "5118aff5091cb3efec399c808f8c598f.jpg",
       "idiom" : "universal",
       "scale" : "1x"
     },
@@ -266,6 +291,7 @@ struct TheMealsAppApp: App {
 //  TheMealsApp
 //
 //  Created by Gilang Ramadhan on 22/11/22.
+//  Updated on 03/04/25.
 //
 
 import Foundation
@@ -273,13 +299,13 @@ import RealmSwift
 
 final class Injection: NSObject {
 
-  private func provideRepository() -> MealRepositoryProtocol {
+  private func provideRepository() -> GameRepositoryProtocol {
     let realm = try? Realm()
 
-    let locale: LocaleDataSource = LocaleDataSource.sharedInstance(realm)
-    let remote: RemoteDataSource = RemoteDataSource.sharedInstance
+    let locale: LocaleGameDataSource = LocaleGameDataSource.sharedInstance(realm)
+    let remote: RemoteGameDataSource = RemoteGameDataSource.sharedInstance
 
-    return MealRepository.sharedInstance(locale, remote)
+    return GameRepository.sharedInstance(locale, remote)
   }
 
   func provideHome() -> HomeUseCase {
@@ -287,21 +313,9 @@ final class Injection: NSObject {
     return HomeInteractor(repository: repository)
   }
 
-  func provideDetail(category: CategoryModel) -> DetailUseCase {
+  func provideDetail(gameId: Int) -> DetailUseCase {
     let repository = provideRepository()
-    return DetailInteractor(repository: repository, category: category)
-  }
-
-    func provideMeal(meal: MealModel, game: GameModel? = nil) -> MealUseCase {
-    let repository = provideRepository()
-        return MealInteractor(repository: repository, meal: meal, game: game ?? <#default value#>)
-  }
-  
-  
-
-  func provideFavorite() -> FavoriteUseCase {
-    let repository = provideRepository()
-    return FavoriteInteractor(repository: repository)
+    return DetailInteractor(repository: repository, gameId: gameId)
   }
 
   func provideSearch() -> SearchUseCase {
@@ -309,6 +323,140 @@ final class Injection: NSObject {
     return SearchInteractor(repository: repository)
   }
 
+  func provideFavorite() -> FavoriteUseCase {
+    let repository = provideRepository()
+    return FavoriteInteractor(repository: repository)
+  }
+}
+
+
+/== TheMealsApp/Core/Data/GameRespository.swift
+//
+//  GameRepository.swift
+//  TheMealsApp
+//
+//  Created on 03/04/25.
+//
+
+import Foundation
+import Combine
+
+protocol GameRepositoryProtocol {
+  func getGames() -> AnyPublisher<[GameModel], Error>
+  func getGameDetail(id: Int) -> AnyPublisher<GameModel, Error>
+  func searchGames(query: String) -> AnyPublisher<[GameModel], Error>
+  func getFavoriteGames() -> AnyPublisher<[GameModel], Error>
+  func addToFavorite(game: GameModel) -> AnyPublisher<Bool, Error>
+  func removeFromFavorite(id: Int) -> AnyPublisher<Bool, Error>
+  func checkIsFavorite(id: Int) -> AnyPublisher<Bool, Error>
+}
+
+final class GameRepository: NSObject {
+  
+  typealias GameInstance = (LocaleGameDataSource, RemoteGameDataSource) -> GameRepository
+  
+  fileprivate let remote: RemoteGameDataSource
+  fileprivate let locale: LocaleGameDataSource
+  
+  private init(locale: LocaleGameDataSource, remote: RemoteGameDataSource) {
+    self.locale = locale
+    self.remote = remote
+  }
+  
+  static let sharedInstance: GameInstance = { localeRepo, remoteRepo in
+    return GameRepository(locale: localeRepo, remote: remoteRepo)
+  }
+}
+
+extension GameRepository: GameRepositoryProtocol {
+  
+  func getGames() -> AnyPublisher<[GameModel], Error> {
+    return self.remote.getGames()
+      .flatMap { games -> AnyPublisher<[GameModel], Error> in
+        return self.addFavoriteStatusToGames(games)
+      }
+      .eraseToAnyPublisher()
+  }
+  
+  func getGameDetail(id: Int) -> AnyPublisher<GameModel, Error> {
+    return self.remote.getGameDetail(id: id)
+      .flatMap { game -> AnyPublisher<GameModel, Error> in
+        return self.locale.checkIsFavorite(id: game.id)
+          .map { isFavorite in
+            return GameModel(
+              id: game.id,
+              name: game.name,
+              released: game.released,
+              backgroundImage: game.backgroundImage,
+              rating: game.rating,
+              ratingCount: game.ratingCount,
+              description: game.description,
+              genres: game.genres,
+              platforms: game.platforms,
+              isFavorite: isFavorite
+            )
+          }
+          .eraseToAnyPublisher()
+      }
+      .eraseToAnyPublisher()
+  }
+  
+  func searchGames(query: String) -> AnyPublisher<[GameModel], Error> {
+    return self.remote.searchGames(query: query)
+      .flatMap { games -> AnyPublisher<[GameModel], Error> in
+        return self.addFavoriteStatusToGames(games)
+      }
+      .eraseToAnyPublisher()
+  }
+  
+  func getFavoriteGames() -> AnyPublisher<[GameModel], Error> {
+    return self.locale.getFavoriteGames()
+      .eraseToAnyPublisher()
+  }
+  
+  func addToFavorite(game: GameModel) -> AnyPublisher<Bool, Error> {
+    return self.locale.addToFavorite(from: game)
+      .eraseToAnyPublisher()
+  }
+  
+  func removeFromFavorite(id: Int) -> AnyPublisher<Bool, Error> {
+    return self.locale.removeFromFavorite(id: id)
+      .eraseToAnyPublisher()
+  }
+  
+  func checkIsFavorite(id: Int) -> AnyPublisher<Bool, Error> {
+    return self.locale.checkIsFavorite(id: id)
+      .eraseToAnyPublisher()
+  }
+  
+  // Helper method to add favorite status to a list of games
+  private func addFavoriteStatusToGames(_ games: [GameModel]) -> AnyPublisher<[GameModel], Error> {
+    // Create a publisher for each game to check if it's a favorite
+    let publishers = games.map { game in
+      self.locale.checkIsFavorite(id: game.id)
+        .map { isFavorite in
+          // Return a new GameModel with updated favorite status
+          return GameModel(
+            id: game.id,
+            name: game.name,
+            released: game.released,
+            backgroundImage: game.backgroundImage,
+            rating: game.rating,
+            ratingCount: game.ratingCount,
+            description: game.description,
+            genres: game.genres,
+            platforms: game.platforms,
+            isFavorite: isFavorite
+          )
+        }
+        .eraseToAnyPublisher()
+    }
+    
+    // Combine all publishers into a single publisher
+    return Publishers.MergeMany(publishers)
+      .collect()
+      .eraseToAnyPublisher()
+  }
 }
 
 
@@ -341,40 +489,57 @@ class CategoryEntity: Object {
 //  GameEntity.swift
 //  TheMealsApp
 //
-//  Created by Ben on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import Foundation
 import RealmSwift
 
 class GameEntity: Object {
-  @objc dynamic var id = 0
-  @objc dynamic var slug = ""
-  @objc dynamic var name = ""
-  @objc dynamic var released = ""
-  @objc dynamic var backgroundImage = ""
-  @objc dynamic var rating = 0.0
-  @objc dynamic var ratingTop = 0
-  @objc dynamic var ratingsCount = 0
-  @objc dynamic var metacritic = 0
-  @objc dynamic var playtime = 0
-  @objc dynamic var updated = ""
-  @objc dynamic var gameDescription = ""
-  @objc dynamic var nameOriginal = ""
-  @objc dynamic var tba = false
-  @objc dynamic var screenshotsCount = 0
-  @objc dynamic var moviesCount = 0
-  @objc dynamic var creatorsCount = 0
-  @objc dynamic var achievementsCount = 0
-  @objc dynamic var parentAchievementsCount = 0
-  @objc dynamic var redditUrl = ""
-  @objc dynamic var redditName = ""
-  @objc dynamic var website = ""
-  @objc dynamic var metacriticUrl = ""
-  @objc dynamic var favorite = false
-
-  override static func primaryKey() -> String {
-    return "id"
+    @Persisted(primaryKey: true) var id: Int
+      @Persisted var name: String = ""
+      @Persisted var released: String = ""
+      @Persisted var backgroundImage: String = ""
+      @Persisted var rating: Double = 0.0
+      @Persisted var ratingCount: Int = 0
+      @Persisted var desc: String = ""
+      @Persisted var genres: List<String> = List<String>()
+      @Persisted var platforms: List<String> = List<String>()
+  
+  func toGameModel() -> GameModel {
+    return GameModel(
+      id: id,
+      name: name,
+      released: released,
+      backgroundImage: backgroundImage,
+      rating: rating,
+      ratingCount: ratingCount,
+      description: desc,
+      genres: genres.map { $0 },
+      platforms: platforms.map { $0 },
+      isFavorite: true
+    )
+  }
+  
+  static func fromGameModel(_ model: GameModel) -> GameEntity {
+    let entity = GameEntity()
+    entity.id = model.id
+    entity.name = model.name
+    entity.released = model.released
+    entity.backgroundImage = model.backgroundImage
+    entity.rating = model.rating
+    entity.ratingCount = model.ratingCount
+    entity.desc = model.description
+    
+    let genresList = List<String>()
+    model.genres.forEach { genresList.append($0) }
+    entity.genres = genresList
+    
+    let platformsList = List<String>()
+    model.platforms.forEach { platformsList.append($0) }
+    entity.platforms = platformsList
+    
+    return entity
   }
 }
 
@@ -558,8 +723,8 @@ extension LocaleDataSource: LocaleDataSourceProtocol {
             gameEntity.setValue(game.released, forKey: "released")
             gameEntity.setValue(game.backgroundImage, forKey: "backgroundImage")
             gameEntity.setValue(game.rating, forKey: "rating")
-            gameEntity.setValue(game.ratingTop, forKey: "ratingTop")
-            gameEntity.setValue(game.favorite, forKey: "favorite")
+//            gameEntity.setValue(game.ratingTop, forKey: "ratingTop")
+//            gameEntity.setValue(game.favorite, forKey: "favorite")
           }
           completion(.success(true))
         } catch {
@@ -593,7 +758,7 @@ extension LocaleDataSource: LocaleDataSourceProtocol {
       }().first {
         do {
           try realm.write {
-            gameEntity.setValue(!gameEntity.favorite, forKey: "favorite")
+//            gameEntity.setValue(!gameEntity.favorite, forKey: "favorite")
           }
           completion(.success(gameEntity))
         } catch {
@@ -853,6 +1018,122 @@ extension Results {
 }
 
 
+/== TheMealsApp/Core/Data/Locale/LocaleGameDataSource.swift
+//
+//  LocaleGameDataSource.swift
+//  TheMealsApp
+//
+//  Created on 03/04/25.
+//
+
+import Foundation
+import RealmSwift
+import Combine
+
+protocol LocaleGameDataSourceProtocol {
+  func getFavoriteGames() -> AnyPublisher<[GameModel], Error>
+  func addToFavorite(from game: GameModel) -> AnyPublisher<Bool, Error>
+  func removeFromFavorite(id: Int) -> AnyPublisher<Bool, Error>
+  func checkIsFavorite(id: Int) -> AnyPublisher<Bool, Error>
+}
+
+final class LocaleGameDataSource: NSObject {
+  
+  private let realm: Realm?
+  
+  private init(realm: Realm?) {
+    self.realm = realm
+  }
+  
+  static let sharedInstance: (Realm?) -> LocaleGameDataSource = { realmDatabase in
+    return LocaleGameDataSource(realm: realmDatabase)
+  }
+}
+
+extension LocaleGameDataSource: LocaleGameDataSourceProtocol {
+  
+  func getFavoriteGames() -> AnyPublisher<[GameModel], Error> {
+    return Future<[GameModel], Error> { completion in
+      if let realm = self.realm {
+        let games: Results<GameEntity> = {
+          realm.objects(GameEntity.self)
+        }()
+        
+        let gameModels = GameMapper.mapGameEntitiesToDomainModels(
+          input: Array(games)
+        )
+        
+        completion(.success(gameModels))
+      } else {
+        completion(.failure(DatabaseError.invalidInstance))
+      }
+    }.eraseToAnyPublisher()
+  }
+  
+  func addToFavorite(from game: GameModel) -> AnyPublisher<Bool, Error> {
+    return Future<Bool, Error> { completion in
+      if let realm = self.realm {
+        do {
+          let gameEntity = GameMapper.mapGameModelToEntity(input: game)
+          try realm.write {
+            realm.add(gameEntity, update: .modified)
+          }
+          completion(.success(true))
+        } catch {
+          completion(.failure(DatabaseError.requestFailed))
+        }
+      } else {
+        completion(.failure(DatabaseError.invalidInstance))
+      }
+    }.eraseToAnyPublisher()
+  }
+  
+  func removeFromFavorite(id: Int) -> AnyPublisher<Bool, Error> {
+    return Future<Bool, Error> { completion in
+      if let realm = self.realm {
+        do {
+          if let game = realm.object(ofType: GameEntity.self, forPrimaryKey: id) {
+            try realm.write {
+              realm.delete(game)
+            }
+            completion(.success(true))
+          } else {
+            completion(.failure(DatabaseError.requestFailed))
+          }
+        } catch {
+          completion(.failure(DatabaseError.requestFailed))
+        }
+      } else {
+        completion(.failure(DatabaseError.invalidInstance))
+      }
+    }.eraseToAnyPublisher()
+  }
+  
+  func checkIsFavorite(id: Int) -> AnyPublisher<Bool, Error> {
+    return Future<Bool, Error> { completion in
+      if let realm = self.realm {
+        let game = realm.object(ofType: GameEntity.self, forPrimaryKey: id)
+        completion(.success(game != nil))
+      } else {
+        completion(.failure(DatabaseError.invalidInstance))
+      }
+    }.eraseToAnyPublisher()
+  }
+}
+//
+//enum DatabaseError: LocalizedError {
+//  case invalidInstance
+//  case requestFailed
+//  
+//  var errorDescription: String? {
+//    switch self {
+//    case .invalidInstance: return "Database can't instance."
+//    case .requestFailed: return "Your request failed."
+//    }
+//  }
+//}
+
+
 /== TheMealsApp/Core/Data/MealRepository.swift
 //
 //  MealRepository.swift
@@ -873,9 +1154,9 @@ protocol MealRepositoryProtocol {
   func getFavoriteMeals() -> AnyPublisher<[MealModel], Error>
   func updateFavoriteMeal(by idMeal: String) -> AnyPublisher<MealModel, Error>
   
-  func getGames(page: Int, pageSize: Int, search: String?) -> AnyPublisher<[GameModel], Error>
-  func getGameDetail(by id: Int) -> AnyPublisher<GameDetailModel, Error>
-  func searchGame(by title: String) -> AnyPublisher<[GameModel], Error>
+//  func getGames(page: Int, pageSize: Int, search: String?) -> AnyPublisher<[GameModel], Error>
+//  func getGameDetail(by id: Int) -> AnyPublisher<GameDetailModel, Error>
+//  func searchGame(by title: String) -> AnyPublisher<[GameModel], Error>
 }
 
 final class MealRepository: NSObject {
@@ -898,30 +1179,30 @@ final class MealRepository: NSObject {
 
 extension MealRepository: MealRepositoryProtocol {
   
-  func searchGame(
-    by title: String
-  ) -> AnyPublisher<[GameModel], Error> {
-    return self.getGames(search: title)
-      .eraseToAnyPublisher()
-  }
-  
-  func getGames(
-    page: Int = 1,
-    pageSize: Int = 10,
-    search: String? = nil
-  ) -> AnyPublisher<[GameModel], Error> {
-    return self.remote.getGames(page: page, pageSize: pageSize, search: search)
-      .map { GameMapper.mapGamesResponseToModels(input: $0) }
-      .eraseToAnyPublisher()
-  }
-  
-  func getGameDetail(
-    by id: Int
-  ) -> AnyPublisher<GameDetailModel, Error> {
-    return self.remote.getGameDetail(by: id)
-      .map { GameMapper.mapGameDetailResponseToModel(input: $0) }
-      .eraseToAnyPublisher()
-  }
+//  func searchGame(
+//    by title: String
+//  ) -> AnyPublisher<[GameModel], Error> {
+//    return self.getGames(search: title)
+//      .eraseToAnyPublisher()
+//  }
+//  
+//  func getGames(
+//    page: Int = 1,
+//    pageSize: Int = 10,
+//    search: String? = nil
+//  ) -> AnyPublisher<[GameModel], Error> {
+//    return self.remote.getGames(page: page, pageSize: pageSize, search: search)
+//      .map { GameMapper.mapGamesResponseToModels(input: $0) }
+//      .eraseToAnyPublisher()
+//  }
+//  
+//  func getGameDetail(
+//    by id: Int
+//  ) -> AnyPublisher<GameDetailModel, Error> {
+//    return self.remote.getGameDetail(by: id)
+//      .map { GameMapper.mapGameDetailResponseToModel(input: $0) }
+//      .eraseToAnyPublisher()
+//  }
 
   func getCategories() -> AnyPublisher<[CategoryModel], Error> {
     return self.locale.getCategories()
@@ -1186,6 +1467,86 @@ extension RemoteDataSource: RemoteDataSourceProtocol {
 }
 
 
+/== TheMealsApp/Core/Data/Remote/RemoteGameDataSource.swift
+//
+//  RemoteGameDataSource.swift
+//  TheMealsApp
+//
+//  Created on 03/04/25.
+//
+
+import Foundation
+import Combine
+
+protocol RemoteGameDataSourceProtocol {
+  func getGames() -> AnyPublisher<[GameModel], Error>
+  func getGameDetail(id: Int) -> AnyPublisher<GameModel, Error>
+  func searchGames(query: String) -> AnyPublisher<[GameModel], Error>
+}
+
+final class RemoteGameDataSource: NSObject {
+  
+  private override init() { }
+  
+  static let sharedInstance: RemoteGameDataSource = RemoteGameDataSource()
+  
+  private let baseUrl = "https://api.rawg.io/api"
+  private let apiKey = "YOUR_API_KEY" // Add your RAWG API key
+  
+  private func createRequest(endpoint: String, queryParams: [String: String] = [:]) -> URLRequest {
+    var components = URLComponents(string: "\(baseUrl)/\(endpoint)")!
+    var queryItems = [URLQueryItem(name: "key", value: apiKey)]
+    
+    for (key, value) in queryParams {
+      queryItems.append(URLQueryItem(name: key, value: value))
+    }
+    
+    components.queryItems = queryItems
+    
+    return URLRequest(url: components.url!)
+  }
+}
+
+extension RemoteGameDataSource: RemoteGameDataSourceProtocol {
+  
+  func getGames() -> AnyPublisher<[GameModel], Error> {
+    let request = createRequest(endpoint: "games")
+    
+    return URLSession.shared.dataTaskPublisher(for: request)
+      .map { $0.data }
+      .decode(type: GamesResponse.self, decoder: JSONDecoder())
+      .map { response in
+        GameMapper.mapGameResponsesToDomainModels(input: response.results)
+      }
+      .eraseToAnyPublisher()
+  }
+  
+  func getGameDetail(id: Int) -> AnyPublisher<GameModel, Error> {
+    let request = createRequest(endpoint: "games/\(id)")
+    
+    return URLSession.shared.dataTaskPublisher(for: request)
+      .map { $0.data }
+      .decode(type: GameDetailResponse.self, decoder: JSONDecoder())
+      .map { response in
+        GameMapper.mapDetailResponseToDomainModel(input: response)
+      }
+      .eraseToAnyPublisher()
+  }
+  
+  func searchGames(query: String) -> AnyPublisher<[GameModel], Error> {
+    let request = createRequest(endpoint: "games", queryParams: ["search": query])
+    
+    return URLSession.shared.dataTaskPublisher(for: request)
+      .map { $0.data }
+      .decode(type: GamesResponse.self, decoder: JSONDecoder())
+      .map { response in
+        GameMapper.mapGameResponsesToDomainModels(input: response.results)
+      }
+      .eraseToAnyPublisher()
+  }
+}
+
+
 /== TheMealsApp/Core/Data/Remote/Response/CategoriesResponse.swift
 //
 //  CategoryResponse.swift
@@ -1219,86 +1580,179 @@ struct CategoryResponse: Decodable {
 }
 
 
-/== TheMealsApp/Core/Data/Remote/Response/GamesResponse.swift
+/== TheMealsApp/Core/Data/Remote/Response/GameDetailResponse.swift
 //
-//  GamesResponse.swift
+//  GameDetailResponse.swift
 //  TheMealsApp
+//
+//  Created on 03/04/25.
 //
 
 import Foundation
 
-struct GamesResponse: Codable {
-    let count: Int
+// This struct matches the structure of the game detail API response
+struct GameDetailResponse: Decodable {
+    let id: Int
+    let name: String
+    let released: String?
+    let backgroundImage: String?
+    let rating: Double
+    let ratingsCount: Int
+    let description: String?
+    let genres: [GenreResponse]
+    let platforms: [PlatformWrapper]
+    let developers: [DeveloperResponse]?
+    let publishers: [PublisherResponse]?
+    let tags: [TagResponse]?
+    let esrbRating: ESRBRating?
+    
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case released
+        case backgroundImage = "background_image"
+        case rating
+        case ratingsCount = "ratings_count"
+        case description = "description_raw"
+        case genres
+        case platforms
+        case developers
+        case publishers
+        case tags
+        case esrbRating = "esrb_rating"
+    }
+    
+    func toGameModel() -> GameModel {
+        return GameModel(
+            id: id,
+            name: name,
+            released: released ?? "Unknown",
+            backgroundImage: backgroundImage ?? "",
+            rating: rating,
+            ratingCount: ratingsCount,
+            description: description ?? "No description available",
+            genres: genres.map { $0.name },
+            platforms: platforms.map { $0.platform.name },
+            isFavorite: false
+        )
+    }
+}
+
+// Additional response types for game detail data
+struct DeveloperResponse: Decodable {
+    let id: Int
+    let name: String
+}
+
+struct PublisherResponse: Decodable {
+    let id: Int
+    let name: String
+}
+
+struct TagResponse: Decodable {
+    let id: Int
+    let name: String
+}
+
+struct ESRBRating: Decodable {
+    let id: Int
+    let name: String
+}
+
+// These response types were already defined in GameResponse.swift
+// Included here for reference in case you need to add them
+/*
+struct GenreResponse: Decodable {
+    let id: Int
+    let name: String
+}
+
+struct PlatformWrapper: Decodable {
+    let platform: PlatformResponse
+}
+
+struct PlatformResponse: Decodable {
+    let id: Int
+    let name: String
+}
+*/
+
+// List response type for the games list endpoint
+struct GamesResponse: Decodable {
+    let results: [GameResponse]
+    let count: Int?
     let next: String?
     let previous: String?
-    let results: [GameResponse]
 }
 
-struct GameResponse: Codable {
-    let id: Int
-    let slug: String
-    let name: String
-    let released: String?
-    let backgroundImage: String?
-    let rating: Double
-    let ratingTop: Int
-    let ratingsCount: Int
-    let metacritic: Int?
-    let playtime: Int
-    let updated: String
-    
-    enum CodingKeys: String, CodingKey {
-        case id, slug, name, released
-        case backgroundImage = "background_image"
-        case rating
-        case ratingTop = "rating_top"
-        case ratingsCount = "ratings_count"
-        case metacritic, playtime, updated
-    }
+
+/== TheMealsApp/Core/Data/Remote/Response/GamesResponse.swift
+//
+//  GameResponse.swift
+//  TheMealsApp
+//
+//  Created on 03/04/25.
+//
+
+import Foundation
+
+struct GameResponse: Decodable {
+  let id: Int
+  let name: String
+  let released: String?
+  let backgroundImage: String?
+  let rating: Double
+  let ratingsCount: Int
+  let description: String?
+  let genres: [GenreResponse]
+  let platforms: [PlatformWrapper]
+  
+  enum CodingKeys: String, CodingKey {
+    case id
+    case name
+    case released
+    case backgroundImage = "background_image"
+    case rating
+    case ratingsCount = "ratings_count"
+    case description = "description_raw"
+    case genres
+    case platforms
+  }
+  
+  func toGameModel() -> GameModel {
+    return GameModel(
+      id: id,
+      name: name,
+      released: released ?? "Unknown",
+      backgroundImage: backgroundImage ?? "",
+      rating: rating,
+      ratingCount: ratingsCount,
+      description: description ?? "No description available",
+      genres: genres.map { $0.name },
+      platforms: platforms.map { $0.platform.name },
+      isFavorite: false
+    )
+  }
 }
 
-struct GameDetailResponse: Codable {
-    let id: Int
-    let slug: String
-    let name: String
-    let nameOriginal: String
-    let description: String
-    let metacritic: Int?
-    let released: String?
-    let tba: Bool
-    let backgroundImage: String?
-    let rating: Double
-    let ratingTop: Int
-    let playtime: Int
-    let screenshotsCount: Int
-    let moviesCount: Int
-    let creatorsCount: Int
-    let achievementsCount: Int
-    let parentAchievementsCount: Int
-    let redditUrl: String?
-    let redditName: String?
-    let website: String?
-    let metacriticUrl: String?
-    
-    enum CodingKeys: String, CodingKey {
-        case id, slug, name
-        case nameOriginal = "name_original"
-        case description, metacritic, released, tba
-        case backgroundImage = "background_image"
-        case rating
-        case ratingTop = "rating_top"
-        case playtime
-        case screenshotsCount = "screenshots_count"
-        case moviesCount = "movies_count"
-        case creatorsCount = "creators_count"
-        case achievementsCount = "achievements_count"
-        case parentAchievementsCount = "parent_achievements_count"
-        case redditUrl = "reddit_url"
-        case redditName = "reddit_name"
-        case website
-        case metacriticUrl = "metacritic_url"
-    }
+struct GenreResponse: Decodable {
+  let id: Int
+  let name: String
 }
+
+struct PlatformWrapper: Decodable {
+  let platform: PlatformResponse
+}
+
+struct PlatformResponse: Decodable {
+  let id: Int
+  let name: String
+}
+
+struct GamesListResponse: Decodable {
+  let results: [GameResponse]
+}
+
 
 /== TheMealsApp/Core/Data/Remote/Response/MealsResponse.swift
 //
@@ -1488,37 +1942,48 @@ struct GameDetailModel: Equatable, Identifiable {
 //  GameModel.swift
 //  TheMealsApp
 //
-//  Created by Ben on 11/01/24.
+//  Created on 03/04/25.
 //
 
 import Foundation
 
 struct GameModel: Equatable, Identifiable {
   let id: Int
-  let slug: String
   let name: String
   let released: String
   let backgroundImage: String
   let rating: Double
-  let ratingTop: Int
-  let ratingsCount: Int
-  let metacritic: Int
-  let playtime: Int
-  let updated: String
-  var description: String = ""
-  var nameOriginal: String = ""
-  var tba: Bool = false
-  var screenshotsCount: Int = 0
-  var moviesCount: Int = 0
-  var creatorsCount: Int = 0
-  var achievementsCount: Int = 0
-  var parentAchievementsCount: Int = 0
-  var redditUrl: String = ""
-  var redditName: String = ""
-  var website: String = ""
-  var metacriticUrl: String = ""
-  var favorite: Bool = false
+  let ratingCount: Int
+  let description: String
+  let genres: [String]
+  let platforms: [String]
+  let isFavorite: Bool
+  
+  init(
+    id: Int,
+    name: String,
+    released: String,
+    backgroundImage: String,
+    rating: Double,
+    ratingCount: Int,
+    description: String,
+    genres: [String],
+    platforms: [String],
+    isFavorite: Bool = false
+  ) {
+    self.id = id
+    self.name = name
+    self.released = released
+    self.backgroundImage = backgroundImage
+    self.rating = rating
+    self.ratingCount = ratingCount
+    self.description = description
+    self.genres = genres
+    self.platforms = platforms
+    self.isFavorite = isFavorite
+  }
 }
+
 
 /== TheMealsApp/Core/Domain/Model/IngredientModel.swift
 //
@@ -1568,117 +2033,113 @@ struct MealModel: Equatable, Identifiable {
 
 /== TheMealsApp/Core/Domain/UseCase/DetailInteractor.swift
 //
-//  DetailInteractor.swift
+//  DetailUseCase.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 22/11/22.
+//  Created on 03/04/25.
 //
 
 import Foundation
 import Combine
 
 protocol DetailUseCase {
-
-  func getCategory() -> CategoryModel
-  func getMeals() -> AnyPublisher<[MealModel], Error>
-  func getGameDetail() -> AnyPublisher<GameDetailModel, Error>
-
+  func getGameDetail() -> AnyPublisher<GameModel, Error>
+  func addToFavorite() -> AnyPublisher<Bool, Error>
+  func removeFromFavorite() -> AnyPublisher<Bool, Error>
+  func checkIsFavorite() -> AnyPublisher<Bool, Error>
+  func getGameId() -> Int
 }
 
 class DetailInteractor: DetailUseCase {
-
-  private let repository: MealRepositoryProtocol
-  private let category: CategoryModel
-
-  required init(
-    repository: MealRepositoryProtocol,
-    category: CategoryModel
-  ) {
+  private let repository: GameRepositoryProtocol
+  private let gameId: Int
+  
+  required init(repository: GameRepositoryProtocol, gameId: Int) {
     self.repository = repository
-    self.category = category
-  }
-
-  func getCategory() -> CategoryModel {
-    return category
-  }
-
-  func getMeals() -> AnyPublisher<[MealModel], Error> {
-    return repository.getMeals(by: category.title)
+    self.gameId = gameId
   }
   
-  func getGameDetail() -> AnyPublisher<GameDetailModel, Error> {
-      return repository.getGameDetail(by: Int(category.id) ?? 0)
+  func getGameDetail() -> AnyPublisher<GameModel, Error> {
+    return repository.getGameDetail(id: gameId)
   }
-
+  
+  func addToFavorite() -> AnyPublisher<Bool, Error> {
+    return repository.getGameDetail(id: gameId)
+      .flatMap { game in
+        self.repository.addToFavorite(game: game)
+      }
+      .eraseToAnyPublisher()
+  }
+  
+  func removeFromFavorite() -> AnyPublisher<Bool, Error> {
+    return repository.removeFromFavorite(id: gameId)
+  }
+  
+  func checkIsFavorite() -> AnyPublisher<Bool, Error> {
+    return repository.checkIsFavorite(id: gameId)
+  }
+  
+  func getGameId() -> Int {
+    return gameId
+  }
 }
 
 
 /== TheMealsApp/Core/Domain/UseCase/FavoriteInteractor.swift
 //
-//  FavoriteInteractor.swift
+//  FavoriteUseCase.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import Foundation
 import Combine
 
 protocol FavoriteUseCase {
-
-  func getFavoriteMeals() -> AnyPublisher<[MealModel], Error>
-
+  func getFavoriteGames() -> AnyPublisher<[GameModel], Error>
 }
 
 class FavoriteInteractor: FavoriteUseCase {
-
-  private let repository: MealRepositoryProtocol
-
-  required init(repository: MealRepositoryProtocol) {
+  
+  private let repository: GameRepositoryProtocol
+  
+  required init(repository: GameRepositoryProtocol) {
     self.repository = repository
   }
-
-  func getFavoriteMeals() -> AnyPublisher<[MealModel], Error> {
-    return repository.getFavoriteMeals()
+  
+  func getFavoriteGames() -> AnyPublisher<[GameModel], Error> {
+    return repository.getFavoriteGames()
   }
-
 }
 
 
 /== TheMealsApp/Core/Domain/UseCase/HomeInteractor.swift
 //
-//  HomeInteractor.swift
+//  HomeUseCase.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 22/11/22.
+//  Created on 03/04/25.
 //
 
 import Foundation
 import Combine
 
 protocol HomeUseCase {
-
-  func getCategories() -> AnyPublisher<[CategoryModel], Error>
-  func getGames(page: Int, pageSize: Int, search: String?) -> AnyPublisher<[GameModel], Error>
-
+  func getGames() -> AnyPublisher<[GameModel], Error>
 }
 
 class HomeInteractor: HomeUseCase {
-
-  private let repository: MealRepositoryProtocol
-
-  required init(repository: MealRepositoryProtocol) {
+  
+  private let repository: GameRepositoryProtocol
+  
+  required init(repository: GameRepositoryProtocol) {
     self.repository = repository
   }
-
-  func getCategories() -> AnyPublisher<[CategoryModel], Error> {
-    return repository.getCategories()
+  
+  func getGames() -> AnyPublisher<[GameModel], Error> {
+    return repository.getGames()
   }
-
-  func getGames(page: Int = 1, pageSize: Int = 10, search: String? = nil) -> AnyPublisher<[GameModel], Error> {
-    return repository.getGames(page: page, pageSize: pageSize, search: search)
-  }
-
 }
 
 
@@ -1698,7 +2159,7 @@ protocol MealUseCase {
   func getMeal() -> AnyPublisher<MealModel, Error>
   func getMeal() -> MealModel
   func updateFavoriteMeal() -> AnyPublisher<MealModel, Error>
-  func getGame() -> AnyPublisher<GameDetailModel, Error>
+//  func getGame() -> AnyPublisher<GameDetailModel, Error>
 
 }
 
@@ -1730,51 +2191,43 @@ class MealInteractor: MealUseCase {
     return repository.updateFavoriteMeal(by: meal.id)
   }
     
-
-  func getGame() -> AnyPublisher<GameDetailModel, Error> {
-      return repository.getGameDetail(by: game.id)
-  }
-    
-  func getGame() -> GameModel {
-        return game
-  }
+//
+//  func getGame() -> AnyPublisher<GameDetailModel, Error> {
+//      return repository.getGameDetail(by: game.id)
+//  }
+//    
+//  func getGame() -> GameModel {
+//        return game
+//  }
 }
 
 
 /== TheMealsApp/Core/Domain/UseCase/SearchInteractor.swift
 //
-//  SearchInteractor.swift
+//  SearchUseCase.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import Foundation
 import Combine
 
 protocol SearchUseCase {
-
-  func searchMeal(by title: String) -> AnyPublisher<[MealModel], Error>
-  func searchGames(by title: String, page: Int) -> AnyPublisher<[GameModel], Error>
-
+  func searchGames(query: String) -> AnyPublisher<[GameModel], Error>
 }
 
 class SearchInteractor: SearchUseCase {
-
-  private let repository: MealRepositoryProtocol
-
-  required init(repository: MealRepositoryProtocol) {
+  
+  private let repository: GameRepositoryProtocol
+  
+  required init(repository: GameRepositoryProtocol) {
     self.repository = repository
   }
-
-  func searchMeal(by title: String) -> AnyPublisher<[MealModel], Error> {
-    return repository.searchMeal(by: title)
+  
+  func searchGames(query: String) -> AnyPublisher<[GameModel], Error> {
+    return repository.searchGames(query: query)
   }
-
-  func searchGames(by title: String, page: Int) -> AnyPublisher<[GameModel], Error> {
-      return repository.getGames(page: page, pageSize: 10, search: title)
-  }
-
 }
 
 
@@ -1900,178 +2353,107 @@ final class CategoryMapper {
 //  GameMapper.swift
 //  TheMealsApp
 //
-//  Created by Ben on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import Foundation
+import RealmSwift
 
 final class GameMapper {
-  static func mapGameResponsesToEntities(
-    input gameResponses: [GameResponse]
-  ) -> [GameEntity] {
-    return gameResponses.map { result in
-      let newGame = GameEntity()
-      newGame.id = result.id
-      newGame.slug = result.slug
-      newGame.name = result.name
-      newGame.released = result.released ?? "Unknown"
-      newGame.backgroundImage = result.backgroundImage ?? "Unknown"
-      newGame.rating = result.rating
-      newGame.ratingTop = result.ratingTop
-      newGame.ratingsCount = result.ratingsCount
-      newGame.metacritic = result.metacritic ?? 0
-      newGame.playtime = result.playtime
-      newGame.updated = result.updated
-      return newGame
+    
+    static func mapGameResponsesToDomainModels(
+        input gameResponses: [GameResponse]
+    ) -> [GameModel] {
+        return gameResponses.map { mapGameResponseToDomainModel(input: $0) }
     }
-  }
-
-  static func mapGameResponsesToDomains(
-    input gameResponses: [GameResponse]
-  ) -> [GameModel] {
-    return gameResponses.map { result in
-      return GameModel(
-        id: result.id,
-        slug: result.slug,
-        name: result.name,
-        released: result.released ?? "Unknown",
-        backgroundImage: result.backgroundImage ?? "Unknown",
-        rating: result.rating,
-        ratingTop: result.ratingTop,
-        ratingsCount: result.ratingsCount,
-        metacritic: result.metacritic ?? 0,
-        playtime: result.playtime,
-        updated: result.updated
-      )
+    static func mapGamesResponseToModels(
+          input gameResponses: [GameResponse]
+      ) -> [GameModel] {
+          return mapGameResponsesToDomainModels(input: gameResponses)
+      }
+      
+    
+    static func mapGameResponseToDomainModel(
+        input response: GameResponse,
+        isFavorite: Bool = false
+    ) -> GameModel {
+        return GameModel(
+            id: response.id,
+            name: response.name,
+            released: response.released ?? "Unknown",
+            backgroundImage: response.backgroundImage ?? "",
+            rating: response.rating,
+            ratingCount: response.ratingsCount,
+            description: response.description ?? "No description available",
+            genres: response.genres.map { $0.name },
+            platforms: response.platforms.map { $0.platform.name },
+            isFavorite: isFavorite
+        )
     }
-  }
-
-  static func mapGameEntitiesToDomains(
-    input gameEntities: [GameEntity]
-  ) -> [GameModel] {
-    return gameEntities.map { result in
-      return GameModel(
-        id: result.id,
-        slug: result.slug,
-        name: result.name,
-        released: result.released,
-        backgroundImage: result.backgroundImage,
-        rating: result.rating,
-        ratingTop: result.ratingTop,
-        ratingsCount: result.ratingsCount,
-        metacritic: result.metacritic,
-        playtime: result.playtime,
-        updated: result.updated,
-        description: result.gameDescription,
-        nameOriginal: result.nameOriginal,
-        tba: result.tba,
-        screenshotsCount: result.screenshotsCount,
-        moviesCount: result.moviesCount,
-        creatorsCount: result.creatorsCount,
-        achievementsCount: result.achievementsCount,
-        parentAchievementsCount: result.parentAchievementsCount,
-        redditUrl: result.redditUrl,
-        redditName: result.redditName,
-        website: result.website,
-        metacriticUrl: result.metacriticUrl,
-        favorite: result.favorite
-      )
+    
+    static func mapDetailResponseToDomainModel(
+        input response: GameDetailResponse,
+        isFavorite: Bool = false
+    ) -> GameModel {
+        return GameModel(
+            id: response.id,
+            name: response.name,
+            released: response.released ?? "Unknown",
+            backgroundImage: response.backgroundImage ?? "",
+            rating: response.rating,
+            ratingCount: response.ratingsCount,
+            description: response.description ?? "No description available",
+            genres: response.genres.map { $0.name },
+            platforms: response.platforms.map { $0.platform.name },
+            isFavorite: isFavorite
+        )
     }
-  }
-
-  static func mapDetailGameEntityToDomain(
-    input gameEntity: GameEntity
-  ) -> GameModel {
-    return GameModel(
-      id: gameEntity.id,
-      slug: gameEntity.slug,
-      name: gameEntity.name,
-      released: gameEntity.released,
-      backgroundImage: gameEntity.backgroundImage,
-      rating: gameEntity.rating,
-      ratingTop: gameEntity.ratingTop,
-      ratingsCount: gameEntity.ratingsCount,
-      metacritic: gameEntity.metacritic,
-      playtime: gameEntity.playtime,
-      updated: gameEntity.updated,
-      description: gameEntity.gameDescription,
-      nameOriginal: gameEntity.nameOriginal,
-      tba: gameEntity.tba,
-      screenshotsCount: gameEntity.screenshotsCount,
-      moviesCount: gameEntity.moviesCount,
-      creatorsCount: gameEntity.creatorsCount,
-      achievementsCount: gameEntity.achievementsCount,
-      parentAchievementsCount: gameEntity.parentAchievementsCount,
-      redditUrl: gameEntity.redditUrl,
-      redditName: gameEntity.redditName,
-      website: gameEntity.website,
-      metacriticUrl: gameEntity.metacriticUrl,
-      favorite: gameEntity.favorite
-    )
-  }
-
-  static func mapDetailGameResponseToEntity(
-    input gameResponse: GameDetailResponse
-  ) -> GameEntity {
-    let gameEntity = GameEntity()
-    gameEntity.id = gameResponse.id
-    gameEntity.slug = gameResponse.slug
-    gameEntity.name = gameResponse.name
-    gameEntity.nameOriginal = gameResponse.nameOriginal
-    gameEntity.gameDescription = gameResponse.description
-    gameEntity.metacritic = gameResponse.metacritic ?? 0
-    gameEntity.released = gameResponse.released ?? "Unknown"
-    gameEntity.tba = gameResponse.tba
-    gameEntity.backgroundImage = gameResponse.backgroundImage ?? "Unknown"
-    gameEntity.rating = gameResponse.rating
-    gameEntity.ratingTop = gameResponse.ratingTop
-    gameEntity.playtime = gameResponse.playtime
-    gameEntity.screenshotsCount = gameResponse.screenshotsCount
-    gameEntity.moviesCount = gameResponse.moviesCount
-    gameEntity.creatorsCount = gameResponse.creatorsCount
-    gameEntity.achievementsCount = gameResponse.achievementsCount
-    gameEntity.parentAchievementsCount = gameResponse.parentAchievementsCount
-    gameEntity.redditUrl = gameResponse.redditUrl ?? ""
-    gameEntity.redditName = gameResponse.redditName ?? ""
-    gameEntity.website = gameResponse.website ?? ""
-    gameEntity.metacriticUrl = gameResponse.metacriticUrl ?? ""
-    return gameEntity
-  }
-
-  static func mapGamesResponseToModels(
-    input gamesResponse: GamesResponse
-  ) -> [GameModel] {
-    return mapGameResponsesToDomains(input: gamesResponse.results)
-  }
-
-  static func mapGameDetailResponseToModel(
-    input gameDetailResponse: GameDetailResponse
-  ) -> GameDetailModel {
-    let gameEntity = mapDetailGameResponseToEntity(input: gameDetailResponse)
-    return GameDetailModel(
-      id: gameEntity.id,
-      slug: gameEntity.slug,
-      name: gameEntity.name,
-      nameOriginal: gameEntity.nameOriginal,
-      description: gameEntity.gameDescription,
-      metacritic: gameEntity.metacritic,
-      released: gameEntity.released,
-      tba: gameEntity.tba,
-      backgroundImage: gameEntity.backgroundImage,
-      rating: gameEntity.rating,
-      ratingTop: gameEntity.ratingTop,
-      playtime: gameEntity.playtime,
-      screenshotsCount: gameEntity.screenshotsCount,
-      moviesCount: gameEntity.moviesCount,
-      creatorsCount: gameEntity.creatorsCount,
-      achievementsCount: gameEntity.achievementsCount,
-      parentAchievementsCount: gameEntity.parentAchievementsCount,
-      redditUrl: gameEntity.redditUrl,
-      redditName: gameEntity.redditName,
-      website: gameEntity.website,
-      metacriticUrl: gameEntity.metacriticUrl
-    )
-  }
+    
+    static func mapGameEntitiesToDomainModels(
+        input gameEntities: [GameEntity]
+    ) -> [GameModel] {
+        return gameEntities.map { mapGameEntityToDomainModel(input: $0) }
+    }
+    
+    static func mapGameEntityToDomainModel(
+        input entity: GameEntity
+    ) -> GameModel {
+        return GameModel(
+            id: entity.id,
+            name: entity.name,
+            released: entity.released,
+            backgroundImage: entity.backgroundImage,
+            rating: entity.rating,
+            ratingCount: entity.ratingCount,
+            description: entity.desc,
+            genres: Array(entity.genres),
+            platforms: Array(entity.platforms),
+            isFavorite: true
+        )
+    }
+    
+    static func mapGameModelToEntity(
+        input model: GameModel
+    ) -> GameEntity {
+        let entity = GameEntity()
+        entity.id = model.id
+        entity.name = model.name
+        entity.released = model.released
+        entity.backgroundImage = model.backgroundImage
+        entity.rating = model.rating
+        entity.ratingCount = model.ratingCount
+        entity.desc = model.description
+        
+        let genresList = List<String>()
+        model.genres.forEach { genresList.append($0) }
+        entity.genres = genresList
+        
+        let platformsList = List<String>()
+        model.platforms.forEach { platformsList.append($0) }
+        entity.platforms = platformsList
+        
+        return entity
+    }
 }
 
 
@@ -2428,26 +2810,28 @@ enum Endpoints {
 //  CustomEmptyView.swift
 //  TheMealsApp
 //
-//  Created by Ari Supriatna on 08/09/20.
-//  Copyright Â© 2020 Dicoding Indonesia. All rights reserved.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
 
 struct CustomEmptyView: View {
+  
   var image: String
   var title: String
-
+  
   var body: some View {
     VStack {
       Image(image)
         .resizable()
         .renderingMode(.original)
         .scaledToFit()
-        .frame(width: 250)
-
+        .frame(width: 250, height: 250)
+      
       Text(title)
         .font(.system(.body, design: .rounded))
+        .multilineTextAlignment(.center)
+        .foregroundColor(.gray)
     }
   }
 }
@@ -2513,32 +2897,31 @@ struct TabItem: View {
 //  DetailPresenter.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 22/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
 import Combine
 
 class DetailPresenter: ObservableObject {
-
+  
   private var cancellables: Set<AnyCancellable> = []
-  private let router = DetailRouter()
   private let detailUseCase: DetailUseCase
-
-  @Published var meals: [MealModel] = []
-  @Published var category: CategoryModel
+  
+  @Published var game: GameModel?
   @Published var errorMessage: String = ""
   @Published var isLoading: Bool = false
   @Published var isError: Bool = false
-
+  @Published var isFavorite: Bool = false
+  
   init(detailUseCase: DetailUseCase) {
     self.detailUseCase = detailUseCase
-    category = detailUseCase.getCategory()
+    checkIsFavorite()
   }
-
-  func getMeals() {
+  
+  func getGameDetail() {
     isLoading = true
-    detailUseCase.getMeals()
+    detailUseCase.getGameDetail()
       .receive(on: RunLoop.main)
       .sink(receiveCompletion: { completion in
         switch completion {
@@ -2549,20 +2932,41 @@ class DetailPresenter: ObservableObject {
         case .finished:
           self.isLoading = false
         }
-      }, receiveValue: { meals in
-        self.meals = meals
+      }, receiveValue: { game in
+        self.game = game
       })
       .store(in: &cancellables)
   }
-
-  func linkBuilder<Content: View>(
-    for meal: MealModel,
-    game: GameModel,
-    @ViewBuilder content: () -> Content
-  ) -> some View {
-      NavigationLink(destination: router.makeMealView(for: meal, game: game)) { content() }
+  
+  func checkIsFavorite() {
+    detailUseCase.checkIsFavorite()
+      .receive(on: RunLoop.main)
+      .sink(receiveCompletion: { _ in },
+            receiveValue: { status in
+              self.isFavorite = status
+            })
+      .store(in: &cancellables)
   }
-
+  
+  func updateFavoriteStatus() {
+    if isFavorite {
+      detailUseCase.removeFromFavorite()
+        .receive(on: RunLoop.main)
+        .sink(receiveCompletion: { _ in },
+              receiveValue: { _ in
+                self.isFavorite = false
+              })
+        .store(in: &cancellables)
+    } else {
+      detailUseCase.addToFavorite()
+        .receive(on: RunLoop.main)
+        .sink(receiveCompletion: { _ in },
+              receiveValue: { _ in
+                self.isFavorite = true
+              })
+        .store(in: &cancellables)
+    }
+  }
 }
 
 
@@ -2578,116 +2982,183 @@ import SwiftUI
 
 class DetailRouter {
 
-func makeMealView(for meal: MealModel, game: GameModel? = nil) -> some View {
-  let mealUseCase = Injection.init().provideMeal(meal: meal, game: game)
-  let presenter = MealPresenter(mealUseCase: mealUseCase)
-  return MealView(presenter: presenter)
-}
+    func makeGameDetailView(for gameId: Int) -> some View {
+       let detailUseCase = Injection.init().provideDetail(gameId: gameId)
+       let presenter = DetailPresenter(detailUseCase: detailUseCase)
+       return DetailView(presenter: presenter)
+     }
 
 }
 
 
 /== TheMealsApp/Module/Detail/View/DetailView.swift
 //
-//  File.swift
+//  DetailView.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 22/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
-import CachedAsyncImage
+import SDWebImageSwiftUI
 
 struct DetailView: View {
+  
   @ObservedObject var presenter: DetailPresenter
-
+  
   var body: some View {
     ZStack {
       if presenter.isLoading {
         loadingIndicator
-      } else if presenter.isLoading {
+      } else if presenter.isError {
         errorIndicator
-      } else {
-        ScrollView(.vertical) {
-          VStack {
-            imageCategory
-            spacer
-            content
-            spacer
-          }.padding()
+      } else if let game = presenter.game {
+        ScrollView(.vertical, showsIndicators: true) {
+          VStack(alignment: .leading, spacing: 16) {
+            headerSection(game)
+            
+            Divider()
+            
+            descriptionSection(game)
+            
+            Divider()
+            
+            detailsSection(game)
+          }
+          .padding()
         }
+      } else {
+        emptyGame
       }
-    }.onAppear {
-      if self.presenter.meals.count == 0 {
-        self.presenter.getMeals()
-      }
-    }.navigationBarTitle(Text(self.presenter.category.title), displayMode: .large)
+    }
+    .navigationBarTitle(
+      Text(presenter.game?.name ?? "Game Detail"),
+      displayMode: .inline
+    )
+    .navigationBarItems(trailing: favoriteButton)
+    .onAppear {
+      self.presenter.getGameDetail()
+    }
+  }
+  
+  var favoriteButton: some View {
+    Button(action: {
+      self.presenter.updateFavoriteStatus()
+    }) {
+      Image(systemName: presenter.isFavorite ? "heart.fill" : "heart")
+        .foregroundColor(presenter.isFavorite ? .red : .gray)
+    }
   }
 }
 
 extension DetailView {
-  var spacer: some View {
-    Spacer()
-  }
-
+  
   var loadingIndicator: some View {
     VStack {
       Text("Loading...")
       ProgressView()
     }
   }
-
+  
   var errorIndicator: some View {
     CustomEmptyView(
       image: "assetSearchNotFound",
       title: presenter.errorMessage
-    ).offset(y: 80)
+    )
   }
-
-  var imageCategory: some View {
-    CachedAsyncImage(url: URL(string: self.presenter.category.image)) { image in
-      image.resizable()
-    } placeholder: {
-      ProgressView()
-    }.scaledToFit().frame(width: 250.0, height: 250.0, alignment: .center)
+  
+  var emptyGame: some View {
+    CustomEmptyView(
+      image: "assetNoData",
+      title: "No game data available"
+    )
   }
-
-  var mealsHorizontal: some View {
-    ScrollView(.horizontal) {
+  
+  func headerSection(_ game: GameModel) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+      WebImage(url: URL(string: game.backgroundImage))
+        .resizable()
+        .indicator(.activity)
+        .transition(.fade(duration: 0.5))
+        .scaledToFill()
+        .frame(height: 200)
+        .clipped()
+        .cornerRadius(12)
+      
+      Text(game.name)
+        .font(.title)
+        .fontWeight(.bold)
+      
       HStack {
-        ForEach(self.presenter.meals, id: \.id) { meal in
-          ZStack {
-            self.presenter.linkBuilder(for: meal) {
-              MealRow(meal: meal)
-                .frame(width: 150, height: 150)
-            }.buttonStyle(PlainButtonStyle())
+        HStack {
+          Image(systemName: "star.fill")
+            .foregroundColor(.yellow)
+          Text(String(format: "%.1f", game.rating))
+          Text("(\(game.ratingCount))")
+            .foregroundColor(.secondary)
+        }
+        
+        Spacer()
+        
+        Text("Released: \(game.released)")
+          .foregroundColor(.secondary)
+      }
+      .font(.subheadline)
+    }
+  }
+  
+  func descriptionSection(_ game: GameModel) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text("Description")
+        .font(.headline)
+      
+      Text(game.description)
+        .font(.body)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+  }
+  
+  func detailsSection(_ game: GameModel) -> some View {
+    VStack(alignment: .leading, spacing: 16) {
+      if !game.genres.isEmpty {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("Genres")
+            .font(.headline)
+          
+          ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+              ForEach(game.genres, id: \.self) { genre in
+                Text(genre)
+                  .font(.caption)
+                  .padding(.horizontal, 12)
+                  .padding(.vertical, 6)
+                  .background(Color.gray.opacity(0.2))
+                  .cornerRadius(16)
+              }
+            }
           }
         }
       }
-    }
-  }
-
-  var description: some View {
-    Text(self.presenter.category.description)
-      .font(.system(size: 15))
-  }
-
-  func headerTitle(_ title: String) -> some View {
-    return Text(title)
-      .font(.headline)
-  }
-
-  var content: some View {
-    VStack(alignment: .leading, spacing: 0) {
-      if !presenter.meals.isEmpty {
-        headerTitle("Meals from \(self.presenter.category.title)")
-          .padding(.bottom)
-        mealsHorizontal
+      
+      if !game.platforms.isEmpty {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("Platforms")
+            .font(.headline)
+          
+          ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+              ForEach(game.platforms, id: \.self) { platform in
+                Text(platform)
+                  .font(.caption)
+                  .padding(.horizontal, 12)
+                  .padding(.vertical, 6)
+                  .background(Color.gray.opacity(0.2))
+                  .cornerRadius(16)
+              }
+            }
+          }
+        }
       }
-      spacer
-      headerTitle("Description")
-        .padding([.top, .bottom])
-      description
     }
   }
 }
@@ -2754,53 +3225,52 @@ extension MealRow {
 //  FavoritePresenter.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
 import Combine
 
 class FavoritePresenter: ObservableObject {
-
+  
   private var cancellables: Set<AnyCancellable> = []
   private let router = FavoriteRouter()
   private let favoriteUseCase: FavoriteUseCase
-
-  @Published var meals: [MealModel] = []
+  
+  @Published var games: [GameModel] = []
   @Published var errorMessage: String = ""
   @Published var isLoading: Bool = false
   @Published var isError: Bool = false
-
+  
   init(favoriteUseCase: FavoriteUseCase) {
     self.favoriteUseCase = favoriteUseCase
   }
-
-  func getFavoriteMeals() {
+  
+  func getFavoriteGames() {
     isLoading = true
-    favoriteUseCase.getFavoriteMeals()
+    favoriteUseCase.getFavoriteGames()
       .receive(on: RunLoop.main)
       .sink(receiveCompletion: { completion in
-          switch completion {
-          case .failure(let error):
-            self.errorMessage = error.localizedDescription
-            self.isError = true
-          case .finished:
-            self.isLoading = false
-          }
-        }, receiveValue: { meals in
-          self.meals = meals
-        })
-        .store(in: &cancellables)
+        switch completion {
+        case .failure(let error):
+          self.errorMessage = error.localizedDescription
+          self.isError = true
+          self.isLoading = false
+        case .finished:
+          self.isLoading = false
+        }
+      }, receiveValue: { games in
+        self.games = games
+      })
+      .store(in: &cancellables)
   }
-
+  
   func linkBuilder<Content: View>(
-    for meal: MealModel,
-    game: GameModel,
+    for gameId: Int,
     @ViewBuilder content: () -> Content
   ) -> some View {
-      NavigationLink(destination: router.makeMealView(for: meal, game: game)) { content() }
+    NavigationLink(destination: router.makeDetailView(for: gameId)) { content() }
   }
-
 }
 
 
@@ -2809,19 +3279,19 @@ class FavoritePresenter: ObservableObject {
 //  FavoriteRouter.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
 
 class FavoriteRouter {
-
-    func makeMealView(for meal: MealModel, game: GameModel) -> some View {
-        let mealUseCase = Injection.init().provideMeal(meal: meal, game: game)
-        let presenter = MealPresenter(mealUseCase: mealUseCase)
-        return MealView(presenter: presenter)
+  
+  func makeDetailView(for gameId: Int) -> some View {
+    let detailUseCase = Injection.init().provideDetail(gameId: gameId)
+    let presenter = DetailPresenter(detailUseCase: detailUseCase)
+    return DetailView(presenter: presenter)
   }
-
+  
 }
 
 
@@ -2901,35 +3371,36 @@ extension FavoriteRow {
 //  FavoriteView.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
+import SDWebImageSwiftUI
 
 struct FavoriteView: View {
-
+  
   @ObservedObject var presenter: FavoritePresenter
-
+  
   var body: some View {
     ZStack {
-
       if presenter.isLoading {
         loadingIndicator
       } else if presenter.isError {
         errorIndicator
-      } else if presenter.meals.count == 0 {
+      } else if presenter.games.isEmpty {
         emptyFavorites
       } else {
         content
       }
-    }.onAppear {
-      self.presenter.getFavoriteMeals()
-    }.navigationBarTitle(
-      Text("Favorite Meals"),
+    }
+    .onAppear {
+      self.presenter.getFavoriteGames()
+    }
+    .navigationBarTitle(
+      Text("Favorite Games"),
       displayMode: .automatic
     )
   }
-
 }
 
 extension FavoriteView {
@@ -2939,37 +3410,35 @@ extension FavoriteView {
       ProgressView()
     }
   }
-
+  
   var errorIndicator: some View {
     CustomEmptyView(
       image: "assetSearchNotFound",
       title: presenter.errorMessage
     ).offset(y: 80)
   }
-
+  
   var emptyFavorites: some View {
     CustomEmptyView(
       image: "assetNoFavorite",
-      title: "Your favorite is empty"
+      title: "Your favorite games list is empty"
     ).offset(y: 80)
   }
-
+  
   var content: some View {
-    ScrollView(
-      .vertical,
-      showsIndicators: false
-    ) {
-      ForEach(
-        self.presenter.meals,
-        id: \.id
-      ) { meal in
-        ZStack {
-            self.presenter.linkBuilder(for: meal, game: <#GameModel#>) {
-            FavoriteRow(meal: meal)
-          }.buttonStyle(PlainButtonStyle())
+    ScrollView(.vertical, showsIndicators: false) {
+      LazyVStack(spacing: 16) {
+        ForEach(self.presenter.games) { game in
+          ZStack {
+            self.presenter.linkBuilder(for: game.id) {
+              GameRow(game: game)
+            }
+            .buttonStyle(PlainButtonStyle())
+          }
+          .padding(.horizontal)
         }
-
       }
+      .padding(.vertical)
     }
   }
 }
@@ -2980,30 +3449,30 @@ extension FavoriteView {
 //  HomePresenter.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 22/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
 import Combine
 
 class HomePresenter: ObservableObject {
-
+  
   private var cancellables: Set<AnyCancellable> = []
   private let router = HomeRouter()
   private let homeUseCase: HomeUseCase
-
-  @Published var categories: [CategoryModel] = []
+  
+  @Published var games: [GameModel] = []
   @Published var errorMessage: String = ""
   @Published var isLoading: Bool = false
   @Published var isError: Bool = false
-
+  
   init(homeUseCase: HomeUseCase) {
     self.homeUseCase = homeUseCase
   }
-
-  func getCategories() {
+  
+  func getGames() {
     isLoading = true
-    homeUseCase.getCategories()
+    homeUseCase.getGames()
       .receive(on: RunLoop.main)
       .sink(receiveCompletion: { completion in
         switch completion {
@@ -3014,19 +3483,18 @@ class HomePresenter: ObservableObject {
         case .finished:
           self.isLoading = false
         }
-      }, receiveValue: { categories in
-        self.categories = categories
+      }, receiveValue: { games in
+        self.games = games
       })
       .store(in: &cancellables)
   }
-
+  
   func linkBuilder<Content: View>(
-    for category: CategoryModel,
+    for gameId: Int,
     @ViewBuilder content: () -> Content
   ) -> some View {
-    NavigationLink(destination: router.makeDetailView(for: category)) { content() }
+    NavigationLink(destination: router.makeDetailView(for: gameId)) { content() }
   }
-
 }
 
 
@@ -3035,19 +3503,19 @@ class HomePresenter: ObservableObject {
 //  HomeRouter.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 22/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
 
 class HomeRouter {
-
-  func makeDetailView(for category: CategoryModel) -> some View {
-    let detailUseCase = Injection.init().provideDetail(category: category)
+  
+  func makeDetailView(for gameId: Int) -> some View {
+    let detailUseCase = Injection.init().provideDetail(gameId: gameId)
     let presenter = DetailPresenter(detailUseCase: detailUseCase)
     return DetailView(presenter: presenter)
   }
-
+  
 }
 
 
@@ -3128,76 +3596,127 @@ struct CategoryRow_Previews: PreviewProvider {
 //  HomeView.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 22/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
+import SDWebImageSwiftUI
 
 struct HomeView: View {
-
+  
   @ObservedObject var presenter: HomePresenter
-
+  
   var body: some View {
     ZStack {
       if presenter.isLoading {
         loadingIndicator
       } else if presenter.isError {
         errorIndicator
-      } else if presenter.categories.isEmpty {
-        emptyCategories
+      } else if presenter.games.isEmpty {
+        emptyGames
       } else {
         content
       }
     }.onAppear {
-      if self.presenter.categories.count == 0 {
-        self.presenter.getCategories()
-      }
+      self.presenter.getGames()
     }.navigationBarTitle(
-      Text("Meals Apps"),
+      Text("Game Catalog"),
       displayMode: .automatic
     )
   }
-
 }
 
 extension HomeView {
-
   var loadingIndicator: some View {
     VStack {
       Text("Loading...")
       ProgressView()
     }
   }
-
+  
   var errorIndicator: some View {
     CustomEmptyView(
       image: "assetSearchNotFound",
       title: presenter.errorMessage
     ).offset(y: 80)
   }
-
-  var emptyCategories: some View {
+  
+  var emptyGames: some View {
     CustomEmptyView(
-      image: "assetNoFavorite",
-      title: "The meal category is empty"
+      image: "assetNoData",
+      title: "No games found"
     ).offset(y: 80)
   }
-
+  
   var content: some View {
     ScrollView(.vertical, showsIndicators: false) {
-      ForEach(
-        self.presenter.categories,
-        id: \.id
-      ) { category in
-        ZStack {
-          self.presenter.linkBuilder(for: category) {
-            CategoryRow(category: category)
-          }.buttonStyle(PlainButtonStyle())
-        }.padding(8)
+      LazyVStack(spacing: 16) {
+        ForEach(self.presenter.games) { game in
+          ZStack {
+            self.presenter.linkBuilder(for: game.id) {
+              GameRow(game: game)
+            }
+            .buttonStyle(PlainButtonStyle())
+          }
+          .padding(.horizontal)
+        }
       }
+      .padding(.vertical)
     }
   }
+}
 
+struct GameRow: View {
+  var game: GameModel
+  
+  var body: some View {
+    HStack(alignment: .top, spacing: 16) {
+      WebImage(url: URL(string: game.backgroundImage))
+        .resizable()
+        .indicator(.activity)
+        .transition(.fade(duration: 0.5))
+        .scaledToFill()
+        .frame(width: 120, height: 80)
+        .cornerRadius(8)
+      
+      VStack(alignment: .leading, spacing: 4) {
+        Text(game.name)
+          .font(.headline)
+          .lineLimit(2)
+        
+        Text("Released: \(game.released)")
+          .font(.subheadline)
+          .foregroundColor(.secondary)
+        
+        HStack {
+          Image(systemName: "star.fill")
+            .foregroundColor(.yellow)
+          Text(String(format: "%.1f", game.rating))
+          Text("(\(game.ratingCount))")
+            .foregroundColor(.secondary)
+        }
+        .font(.subheadline)
+        
+        if !game.genres.isEmpty {
+          Text(game.genres.prefix(3).joined(separator: ", "))
+            .font(.caption)
+            .foregroundColor(.secondary)
+            .lineLimit(1)
+        }
+      }
+      
+      Spacer()
+      
+      if game.isFavorite {
+        Image(systemName: "heart.fill")
+          .foregroundColor(.red)
+      }
+    }
+    .padding()
+    .background(Color(.systemBackground))
+    .cornerRadius(12)
+    .shadow(color: Color.black.opacity(0.1), radius: 5, x: 0, y: 2)
+  }
 }
 
 
@@ -3415,32 +3934,40 @@ extension MealView {
 //  SearchPresenter.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
 import Combine
 
 class SearchPresenter: ObservableObject {
-
+  
   private var cancellables: Set<AnyCancellable> = []
   private let router = SearchRouter()
   private let searchUseCase: SearchUseCase
-
-  @Published var meals: [MealModel] = []
+  
+  @Published var games: [GameModel] = []
+  @Published var searchQuery: String = ""
   @Published var errorMessage: String = ""
   @Published var isLoading: Bool = false
   @Published var isError: Bool = false
-
-  var title = ""
-
+  
   init(searchUseCase: SearchUseCase) {
     self.searchUseCase = searchUseCase
+    
+    $searchQuery
+      .debounce(for: .milliseconds(800), scheduler: RunLoop.main)
+      .removeDuplicates()
+      .filter { !$0.isEmpty }
+      .sink(receiveValue: { [weak self] query in
+        self?.searchGames(query: query)
+      })
+      .store(in: &cancellables)
   }
-
-  func searchMeal() {
+  
+  func searchGames(query: String) {
     isLoading = true
-    searchUseCase.searchMeal(by: title)
+    searchUseCase.searchGames(query: query)
       .receive(on: RunLoop.main)
       .sink(receiveCompletion: { completion in
         switch completion {
@@ -3451,20 +3978,18 @@ class SearchPresenter: ObservableObject {
         case .finished:
           self.isLoading = false
         }
-      }, receiveValue: { meals in
-        self.meals = meals
+      }, receiveValue: { games in
+        self.games = games
       })
       .store(in: &cancellables)
   }
-
+  
   func linkBuilder<Content: View>(
-    for meal: MealModel,
-    game: GameModel,
+    for gameId: Int,
     @ViewBuilder content: () -> Content
   ) -> some View {
-      NavigationLink(destination: router.makeMealView(for: meal, game: game)) { content() }
+    NavigationLink(destination: router.makeDetailView(for: gameId)) { content() }
   }
-
 }
 
 
@@ -3473,19 +3998,19 @@ class SearchPresenter: ObservableObject {
 //  SearchRouter.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
 
 class SearchRouter {
-
-    func makeMealView(for meal: MealModel, game: GameModel) -> some View {
-        let mealUseCase = Injection.init().provideMeal(meal: meal, game: game)
-        let presenter = MealPresenter(mealUseCase: mealUseCase)
-        return MealView(presenter: presenter)
+  
+  func makeDetailView(for gameId: Int) -> some View {
+    let detailUseCase = Injection.init().provideDetail(gameId: gameId)
+    let presenter = DetailPresenter(detailUseCase: detailUseCase)
+    return DetailView(presenter: presenter)
   }
-
+  
 }
 
 
@@ -3565,80 +4090,121 @@ extension SearchRow {
 //  SearchView.swift
 //  TheMealsApp
 //
-//  Created by Gilang Ramadhan on 29/11/22.
+//  Created on 03/04/25.
 //
 
 import SwiftUI
+import SDWebImageSwiftUI
 
 struct SearchView: View {
-
+  
   @ObservedObject var presenter: SearchPresenter
-
+  
   var body: some View {
-    VStack {
-      Spacer()
-      ZStack {
+    ZStack {
+      VStack {
+        searchBar
+        
         if presenter.isLoading {
           loadingIndicator
-        } else if presenter.title.isEmpty {
-          emptyTitle
-        } else if presenter.meals.isEmpty {
-          emptyMeals
         } else if presenter.isError {
           errorIndicator
+        } else if presenter.games.isEmpty && !presenter.searchQuery.isEmpty {
+          emptyGames
+        } else if !presenter.games.isEmpty {
+          gameList
         } else {
-          ScrollView(.vertical, showsIndicators: false) {
-            ForEach(
-              self.presenter.meals,
-              id: \.id
-            ) { meal in
-              ZStack {
-                self.presenter.linkBuilder(for: meal) {
-                  SearchRow(meal: meal)
-                }.buttonStyle(PlainButtonStyle())
-              }.padding(8)
-            }
-          }
+          startSearching
         }
-      }.searchable(text: $presenter.title)
-        .onSubmit(of: .search, presenter.searchMeal)
-      Spacer()
-    }.navigationBarTitle(
-      Text("Search Meals"),
+      }
+    }
+    .navigationBarTitle(
+      Text("Search Games"),
       displayMode: .automatic
     )
+  }
+  
+  var searchBar: some View {
+    HStack {
+      Image(systemName: "magnifyingglass")
+        .foregroundColor(.gray)
+      
+      TextField("Search for games...", text: $presenter.searchQuery)
+        .disableAutocorrection(true)
+      
+      if !presenter.searchQuery.isEmpty {
+        Button(action: {
+          presenter.searchQuery = ""
+          presenter.games = []
+        }) {
+          Image(systemName: "xmark.circle.fill")
+            .foregroundColor(.gray)
+        }
+      }
+    }
+    .padding()
+    .background(Color(.systemGray6))
+    .cornerRadius(10)
+    .padding()
   }
 }
 
 extension SearchView {
-
   var loadingIndicator: some View {
     VStack {
-      Text("Loading...")
+      Spacer()
       ProgressView()
+        .progressViewStyle(CircularProgressViewStyle())
+      Text("Searching...")
+        .padding(.top, 8)
+      Spacer()
     }
   }
-
+  
   var errorIndicator: some View {
     CustomEmptyView(
       image: "assetSearchNotFound",
       title: presenter.errorMessage
-    ).offset(y: 80)
+    )
   }
-
-  var emptyTitle: some View {
-    CustomEmptyView(
-      image: "assetSearchMeal",
-      title: "Come on, find your favorite food!"
-    ).offset(y: 50)
-  }
-  var emptyMeals: some View {
+  
+  var emptyGames: some View {
     CustomEmptyView(
       image: "assetSearchNotFound",
-      title: "Data not found"
-    ).offset(y: 80)
+      title: "No games found matching '\(presenter.searchQuery)'"
+    )
   }
-
+  
+  var startSearching: some View {
+    VStack {
+      Spacer()
+      Image(systemName: "magnifyingglass")
+        .font(.system(size: 85))
+        .foregroundColor(.gray)
+      Text("Search for your favorite games")
+        .font(.title3)
+        .foregroundColor(.gray)
+        .padding()
+      Spacer()
+    }
+  }
+  
+  var gameList: some View {
+    ScrollView {
+      LazyVStack(spacing: 16) {
+        ForEach(presenter.games) { game in
+          ZStack {
+            self.presenter.linkBuilder(for: game.id) {
+              GameRow(game: game)
+            }
+            .buttonStyle(PlainButtonStyle())
+          }
+          .padding(.horizontal)
+        }
+      }
+      .padding(.vertical)
+    }
+  }
 }
 
 
@@ -3718,6 +4284,11 @@ extension SearchView {
 		B5FD193A2D9D554000DC56F7 /* GameModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5FD19392D9D554000DC56F7 /* GameModel.swift */; };
 		B5FD193B2D9D554000DC56F7 /* GameDetailModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5FD19382D9D554000DC56F7 /* GameDetailModel.swift */; };
 		B5FD193D2D9D556F00DC56F7 /* GameMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5FD193C2D9D556F00DC56F7 /* GameMapper.swift */; };
+		B5FD193F2D9DD00900DC56F7 /* GameRespository.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5FD193E2D9DD00100DC56F7 /* GameRespository.swift */; };
+		B5FD19412D9DD0EA00DC56F7 /* LocaleGameDataSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5FD19402D9DD0E600DC56F7 /* LocaleGameDataSource.swift */; };
+		B5FD19432D9DD11A00DC56F7 /* RemoteGameDataSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5FD19422D9DD11800DC56F7 /* RemoteGameDataSource.swift */; };
+		B5FD19462D9DD36800DC56F7 /* SDWebImageSwiftUI in Frameworks */ = {isa = PBXBuildFile; productRef = B5FD19452D9DD36800DC56F7 /* SDWebImageSwiftUI */; };
+		B5FD19482D9DDFC400DC56F7 /* GameDetailResponse.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5FD19472D9DDFBF00DC56F7 /* GameDetailResponse.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -3775,6 +4346,10 @@ extension SearchView {
 		B5FD19382D9D554000DC56F7 /* GameDetailModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameDetailModel.swift; sourceTree = "<group>"; };
 		B5FD19392D9D554000DC56F7 /* GameModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameModel.swift; sourceTree = "<group>"; };
 		B5FD193C2D9D556F00DC56F7 /* GameMapper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameMapper.swift; sourceTree = "<group>"; };
+		B5FD193E2D9DD00100DC56F7 /* GameRespository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameRespository.swift; sourceTree = "<group>"; };
+		B5FD19402D9DD0E600DC56F7 /* LocaleGameDataSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocaleGameDataSource.swift; sourceTree = "<group>"; };
+		B5FD19422D9DD11800DC56F7 /* RemoteGameDataSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteGameDataSource.swift; sourceTree = "<group>"; };
+		B5FD19472D9DDFBF00DC56F7 /* GameDetailResponse.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameDetailResponse.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -3782,6 +4357,7 @@ extension SearchView {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B5FD19462D9DD36800DC56F7 /* SDWebImageSwiftUI in Frameworks */,
 				2AC96396292CB18A0061B65A /* RealmSwift in Frameworks */,
 				2AC9639F292CB8270061B65A /* CachedAsyncImage in Frameworks */,
 				2AC96394292CB18A0061B65A /* Realm in Frameworks */,
@@ -3999,6 +4575,7 @@ extension SearchView {
 				2AC96397292CB24F0061B65A /* Locale */,
 				2A9D4545292C8144008FABEB /* Remote */,
 				2A9D454B292C819A008FABEB /* MealRepository.swift */,
+				B5FD193E2D9DD00100DC56F7 /* GameRespository.swift */,
 			);
 			path = Data;
 			sourceTree = "<group>";
@@ -4034,6 +4611,7 @@ extension SearchView {
 		2A9D4545292C8144008FABEB /* Remote */ = {
 			isa = PBXGroup;
 			children = (
+				B5FD19422D9DD11800DC56F7 /* RemoteGameDataSource.swift */,
 				2A9D4546292C814E008FABEB /* Response */,
 				2A9D4549292C817B008FABEB /* RemoteDataSource.swift */,
 			);
@@ -4043,6 +4621,7 @@ extension SearchView {
 		2A9D4546292C814E008FABEB /* Response */ = {
 			isa = PBXGroup;
 			children = (
+				B5FD19472D9DDFBF00DC56F7 /* GameDetailResponse.swift */,
 				2A9D4547292C8162008FABEB /* CategoriesResponse.swift */,
 				2A91C7712935DB41005A9155 /* MealsResponse.swift */,
 				B5FD19322D9D54DA00DC56F7 /* GamesResponse.swift */,
@@ -4147,6 +4726,7 @@ extension SearchView {
 		2AC96397292CB24F0061B65A /* Locale */ = {
 			isa = PBXGroup;
 			children = (
+				B5FD19402D9DD0E600DC56F7 /* LocaleGameDataSource.swift */,
 				2AC9639C292CB27B0061B65A /* Entity */,
 				2AC96398292CB25E0061B65A /* LocaleDataSource.swift */,
 			);
@@ -4185,6 +4765,7 @@ extension SearchView {
 				2AC96393292CB18A0061B65A /* Realm */,
 				2AC96395292CB18A0061B65A /* RealmSwift */,
 				2AC9639E292CB8270061B65A /* CachedAsyncImage */,
+				B5FD19452D9DD36800DC56F7 /* SDWebImageSwiftUI */,
 			);
 			productName = TheMealsApp;
 			productReference = 2A9D452B292C805D008FABEB /* TheMealsApp.app */;
@@ -4218,6 +4799,7 @@ extension SearchView {
 				2A9276AE292CAA7B00C30767 /* XCRemoteSwiftPackageReference "Alamofire" */,
 				2AC96392292CB18A0061B65A /* XCRemoteSwiftPackageReference "realm-swift" */,
 				2AC9639D292CB8270061B65A /* XCRemoteSwiftPackageReference "swiftui-cached-async-image" */,
+				B5FD19442D9DD36800DC56F7 /* XCRemoteSwiftPackageReference "SDWebImageSwiftUI" */,
 			);
 			productRefGroup = 2A9D452C292C805D008FABEB /* Products */;
 			projectDirPath = "";
@@ -4252,8 +4834,10 @@ extension SearchView {
 				2A9D454A292C817B008FABEB /* RemoteDataSource.swift in Sources */,
 				2A91C7952935DEDB005A9155 /* MealPresenter.swift in Sources */,
 				2A9D4531292C805D008FABEB /* ContentView.swift in Sources */,
+				B5FD19482D9DDFC400DC56F7 /* GameDetailResponse.swift in Sources */,
 				2A9D456A292C84C2008FABEB /* CategoryRow.swift in Sources */,
 				2A91C79E2935E061005A9155 /* DetailRouter.swift in Sources */,
+				B5FD193F2D9DD00900DC56F7 /* GameRespository.swift in Sources */,
 				2A91C76E2935DB11005A9155 /* MealEntity.swift in Sources */,
 				B5FD19332D9D54DA00DC56F7 /* GamesResponse.swift in Sources */,
 				2A91C7782935DC8A005A9155 /* FavoriteInteractor.swift in Sources */,
@@ -4266,6 +4850,7 @@ extension SearchView {
 				2A9D4561292C82A2008FABEB /* Color+Ext.swift in Sources */,
 				B5FD193A2D9D554000DC56F7 /* GameModel.swift in Sources */,
 				B5FD193B2D9D554000DC56F7 /* GameDetailModel.swift in Sources */,
+				B5FD19412D9DD0EA00DC56F7 /* LocaleGameDataSource.swift in Sources */,
 				2A9D4556292C8225008FABEB /* DetailInteractor.swift in Sources */,
 				2A9D456C292C8577008FABEB /* HomeRouter.swift in Sources */,
 				2A91C77C2935DCB6005A9155 /* SearchInteractor.swift in Sources */,
@@ -4281,6 +4866,7 @@ extension SearchView {
 				2A91C7972935DEF3005A9155 /* MealView.swift in Sources */,
 				2A91C77E2935DCFA005A9155 /* MealMapper.swift in Sources */,
 				2A91C7AD2935FE79005A9155 /* TabItem.swift in Sources */,
+				B5FD19432D9DD11A00DC56F7 /* RemoteGameDataSource.swift in Sources */,
 				2A91C7742935DC3E005A9155 /* MealModel.swift in Sources */,
 				2A9D455F292C828E008FABEB /* CustomeError+Ext.swift in Sources */,
 				2A9D4551292C81DD008FABEB /* CategoryModel.swift in Sources */,
@@ -4522,6 +5108,14 @@ extension SearchView {
 				minimumVersion = 2.0.0;
 			};
 		};
+		B5FD19442D9DD36800DC56F7 /* XCRemoteSwiftPackageReference "SDWebImageSwiftUI" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/SDWebImage/SDWebImageSwiftUI.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 3.1.3;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -4544,6 +5138,11 @@ extension SearchView {
 			isa = XCSwiftPackageProductDependency;
 			package = 2AC9639D292CB8270061B65A /* XCRemoteSwiftPackageReference "swiftui-cached-async-image" */;
 			productName = CachedAsyncImage;
+		};
+		B5FD19452D9DD36800DC56F7 /* SDWebImageSwiftUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B5FD19442D9DD36800DC56F7 /* XCRemoteSwiftPackageReference "SDWebImageSwiftUI" */;
+			productName = SDWebImageSwiftUI;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
@@ -4574,6 +5173,7 @@ extension SearchView {
 
 /== TheMealsApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 {
+  "originHash" : "a1a1061106ac97c26bec79dad5ef007c9094b0aaf3572f79960d081c60d51db8",
   "pins" : [
     {
       "identity" : "alamofire",
@@ -4603,6 +5203,24 @@ extension SearchView {
       }
     },
     {
+      "identity" : "sdwebimage",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/SDWebImage/SDWebImage.git",
+      "state" : {
+        "revision" : "cac9a55a3ae92478a2c95042dcc8d9695d2129ca",
+        "version" : "5.21.0"
+      }
+    },
+    {
+      "identity" : "sdwebimageswiftui",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/SDWebImage/SDWebImageSwiftUI.git",
+      "state" : {
+        "revision" : "451c6dfd5ecec2cf626d1d9ca81c2d4a60355172",
+        "version" : "3.1.3"
+      }
+    },
+    {
       "identity" : "swiftui-cached-async-image",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/lorenzofiamingo/swiftui-cached-async-image",
@@ -4612,276 +5230,281 @@ extension SearchView {
       }
     }
   ],
-  "version" : 2
+  "version" : 3
 }
 
 
 /== TheMealsApp.xcodeproj/project.xcworkspace/xcuserdata/ben.xcuserdatad/UserInterfaceState.xcuserstate
 bplist00Ô        
-X$versionY$archiverT$topX$objects † _NSKeyedArchiverÑ  	UState€¯]      9 : ; < = > ? @ A B C D E F G T Z [ a e f j k o p t u y z ~  ƒ „ ˆ ‰   ‘ › œ   ¦ ª « ± ² ¶ À Æ Ê Î Ò × Û á â æ ì ï ò.2378<=ABFGKLPQUVZ[_`deijnostxy}~‚ƒ‡ˆŒ¥¦§¨©ª«¬­®¯³º»¼ ½¾ÆÇÈĞÑÒÕÖØâãäåæêíñòóûüı#*+,456>?@JKLMQUVW_`xyz{|}~€‚†•–—¡¢£¤¨¬´µ¶¹ÁÂÚÛÜİŞßàáâãäèïğñùúû"#;<=>?@ABCDEIPQRZ[\fghimqyz{ƒ„œŸ ¡¢£¤¥¦ª±¹º»ÅÆÇÈÌĞØÙÚÛãäüışÿ 
-%&'12348<DE]^_`abcdefgkrst|}~ˆ‰Š‹“›œŸ§¨ÀÁÂÃÄÅÆÇÈÉÊÎÕÖŞßàêëìíñõışÿ !"#$%&'()*.56>?@JKLMQU]^_gh€‚ƒ„…†‡ˆ‰Š•–—Ÿ ¡«¬­®²¶¾¿ÀÈÉáâãäåæçèéêëïö÷ø  !)*BCDEFGHIJKLPW_`aklmnrv~‡ˆ ¡¢£¤¥¦§¨©ª®µ½¾¿ÉÊËÌĞÔÜİŞæçÿ 	'()3456:>FG_`abcdefghimtuv~€ˆ‰Š”•–—›Ÿ ¡©ªÂÃÄÅÆÇÈÉÊËÌĞ×ßàáéêëõö÷øü 	!"#$%&'()*+/6>?@HIJTUVW[_gh€‚ƒ„…†‡ˆ‰Š•Ÿ§¨©³´µ¶º¾ÆÇßàáâãäåæçèéíôõışÿ												 	(	)	A	B	C	D	E	F	G	H	I	J	K	O	V	^	_	`	h	i	j	t	u	v	w	{		‡	ˆ	 	¡	¢	£	¤	¥	¦	§	¨	©	ª	®	µ	½	¾	¿	Ç	È	É	Ó	Ô	Õ	Ö	Ú	Ş	æ	ç	ÿ
- 
-
+X$versionY$archiverT$topX$objects † _NSKeyedArchiverÑ  	UState€¯°      9 : ; < = > ? @ A B C D E F G T Z [ a e f j k o p t u y z ~  ƒ „ ˆ ‰   ‘   Ÿ   ¡ ÿ	!"&'+,0156:;?@DEIJNOSTXY]^bcghlmqrvw{|€…†Š‹”•™šŸ£¤¨©­®²³ËÌÍÎÏĞÑÒÓÔÕÙàáâãëìí÷øùúş	 !"%=>?@ABCDEFGKRZ[\fghimqyz{|„…Ÿ ¡¢£¤¥¦§«²³´µ½¾¿ÉÊËÌĞÔÜİàáâãëì	
+#$%/0126:BCDLMefghijklmnosz{|„…†š›œ¡¥­®ÆÇÈÉÊËÌÍÎÏĞÔÛÜäåæğñòó÷û()*+,-./0126=EFGQRSTX\defno‡ˆ‰Š‹Œ‘•œ¥¦§¯°±»¼½¾ÂÆÎÏçèéêëìíîïğñõüış%&'()12JKLMNOPQRSTX_`hijrst~€…‰‘’ª«¬­®¯°±²³´¸¿ÇÈÉÓÔÕÖÚŞæçèéêòó !)*+345?@ABFJRSklmnopqrstuy€ˆ‰Š”•–—›Ÿ§¨©±²ÊËÌÍÎÏĞÑÒÓÔØßàáéêëõö÷øü 	
+-./01234567;BCDLMNVWXbcdeimnvw‘’“”•–—˜™¤¬­®¸¹º»¿ÃËÌÍÕÖîïğñòóôõö÷øü $,-.67OPQRSTUVWXY]demnoyz{|€„Œ–—¯°±²³´µ¶·¸¹½ÄÌÍÎØÙÚÛßãëìíõö													#	+	,	-	5	6	7	A	B	C	D	H	L	T	U	m	n	o	p	q	r	s	t	u	v	w	{	‚	ƒ	‹	Œ		•	–	—	¡	¢	£	¤	¨	¬	­	µ	¶	Î	Ï	Ğ	Ñ	Ò	Ó	Ô	Õ	Ö	×	Ø	Ü	ã	ä	ì	í	î	ö	÷	ø
 
 
 
 
-
-
-
 	
 
-
 
-
-
-
-'
-(
-)
+
+.
+/
+0
+1
+2
 3
 4
 5
 6
-:
->
-?
-@
-H
-I
-a
+7
+8
+<
+C
+D
+L
+M
+N
+V
+W
+X
 b
 c
 d
 e
-f
-g
-h
 i
-j
-k
-o
+m
+u
 v
-~
-
-€
-ˆ
-‰
-Š
+
+
+
+‘
+’
+“
 ”
 •
 –
 —
-›
-Ÿ
-§
-¨
-À
-Á
+˜
+œ
+£
+¤
+¬
+­
+®
+¶
+·
+¸
 Â
 Ã
 Ä
 Å
-Æ
-Ç
-È
 É
-Ê
-Î
+Í
 Õ
+Ö
+î
+ï
+ğ
+ñ
+ò
+ó
+ô
+õ
+ö
+÷
+ø
+ü!"#$(,45MNOPQRSTUVW[bcklmwxyz~‚Š‹Œ•–®¯°±²³´µ¶·¸¼ÃÄÅÍÎÏ×ØÙãäåæêîï÷ø%&'/01;<=>BFNOPXYqrstuvwxyz{†‡‘™š›¥¦§¨¬°±¹ºÒÓÔÕÖ×ØÙÚÛÜàçèğñòúûü	23456789:;<@GHPQRZ[\fghimqyz’“”•–—˜™š›œ §¨°±²¼½¾¿ÃÇÏĞÑÙÚòóôõö÷øùúûü &'()-19:RSTUVWXYZ[\`gopqyz{…†‡ˆŒ˜™±²³´µ¶·¸¹º»¿ÆÇÏĞÑÛÜİŞâæîïğñùú '(012<=>?CGOPQRZ[stuvwxyz{|}ˆ‘’š›œ¦§¨©­±¹ºÒÓÔÕÖ×ØÙÚÛÜàçèğñòúûü	23456789:;<@GOPQ[\]^bfnopxy‘’“”•–—˜™š›Ÿ¦®¯°º»¼½ÁÅÍÎÖ×ïğñòóôõö÷øùı"#$%)-56NOPQRSTUVWX\cklmuvw‚ƒ„ˆŒ”•­®¯°±²³´µ¶·»ÂÊËÌÔÕÖàáâãçëóô!"#+,-789:>BJKLTUmnopqrstuvw{‚Š‹Œ”•– ¡¢£§«³´º¾¿ËÌÍÎÏĞÑÕİŞßçèéêëğôü "&*/56:@CFL`abcdefghlmquvwx|‚ƒ‡ˆŠ‹•–—™œ ¦ª­·¸¹ºÀÁÅÈÎÏÓ×İŞáùúûüışÿ 	
+ &01234>?BRSTUVYZnopqrstuvw‘’“”•–¦§¨©ª«¬¸¹º»¼ÀÁÇÈÌÍÒÚÛÜæçèéêò÷úşÿ !%&'345678DEFGHNOPQWX\]cdhijrstwx~‡ˆ‰£¤¥¦§¨©ª«¬­®±²³·»ËÌÍÎÏĞÑÒÚÛÜäô 
+#$()-.237;<AEFG_`abcdefghimtu}~‡ˆ’“”•™¥¦§«´»ÁÅÆÊÎÏÓÔÕéêëìíîïğñõöúûü !*./348<@DEIJbcdefghijklpw€‰Š”•–—›Ÿ§¨©²¹ÂÆÇËÌĞÔØÜİáâúûüışÿ !",-./37?@AJQX\]abfjkopˆ‰Š‹Œ‘’–¥¦§±²³´¸¼ÄÅÍÎÏÓ×àçğôøü 	%&'()*+,-./3:BCDLMWXYZ^bjklpqx…‰‘•™š¤¥ª´µ¶·¸¹ÃÄÅÆÒÓÔÕÖâãäåæúûüışÿ 	$%&U$nullÓ      WNS.keysZNS.objectsV$class¢  €€¢  € €“_IDEWorkspaceDocument_$9229D32F-C4FF-43F2-A95F-816FAA71C582Ó     ) 8®        ! " # $ % & ' (€€€€€	€
+€€€€€€€€® * + , - . / 0 1 2 3 - 5 6 0€€*½À€…Â€†ÃÆÕÀçè€†€_RecentEditorDocumentURLs_DefaultEditorStatesForURLs\ActiveScheme_ActiveProjectSetIdentifierKey_$RunDestinationArchitectureVisibility_DocumentWindows_EnableThreadGallery_WindowArrangementDebugInfo_RunContextRecents_ActiveRunDestination_ActiveProjectSetNameKey_SelectedWindows_0LastCompletedPersistentSchemeBasedActivityReport_BreakpointsActivatedÒ   H Sª I J K L M N O P Q R€€€€€€€!€#€%€'€)Ó U  V W X YWNS.base[NS.relative€ €€_jfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Home/View/HomeView.swiftÒ \ ] ^ _Z$classnameX$classesUNSURL¢ ^ `XNSObjectÓ U  V W X d€ €€_Zfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Assets.xcassetsÓ U  V W X i€ €€_`file:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/App/ContentView.swiftÓ U  V W X n€ €€_nfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Home/Router/HomeRouter.swiftÓ U  V W X s€ €€_tfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Home/Presenter/HomePresenter.swiftÓ U  V W X x€ €€ _vfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Remote/RemoteGameDataSource.swiftÓ U  V W X }€ €€"_kfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Utils/Network/APICall.swiftÓ U  V W X ‚€ €€$_sfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/MealInteractor.swiftÓ U  V W X ‡€ €€&_ifile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/MealRepository.swiftÓ U  V W X Œ€ €€(_mfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Utils/Mapper/GameMapper.swiftÒ \ ]  WNSArray¢  `Ó    ’ — 8¤ “ ” • –€+€,€-€.¤ ˜ ™ š ›€/{¤€_-Xcode.IDEKit.EditorDocument.PegasusSourceCode_7Xcode.Xcode3ProjectSupport.EditorDocument.Xcode3Project_'Xcode.IDEKit.EditorDocument.LogDocument_(Xcode.IDEKit.EditorDocument.AssetCatalogÓ    ¢ Ğ 8¯- £ ¤ ¥ ¦ § N © ª Q ¬ ­ ® ¯ K ± ² P ´ L ¶ O ¸ ¹ R » ¼ M ¾ ¿ À Á Â Ã Ä Å I Ç È É Ê Ë Ì Í Î Ï€0€2€4€6€8€€:€<€%€>€@€B€D€€F€H€#€J€€L€!€N€P€'€R€T€€V€X€Z€\€^€`€b€d€€f€h€j€l€n€p€r€t€v¯- Ñ Ò Ó Ô Õ Ö × Ø Ù Ú Û Ü İ Ş ß à á â ã ä å æ ç è é ê ë ì í î ï ğ ñ ò ó ô õ ö ÷ ø ù ú û ü ı€x€€º€Û€ø3Nj‰¥ÂŞù6QnŠ¥Àİù1Li‡¤Áİù1Li†¡½Øò(C`€Ó U  V W X€ €€1_sfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/MealEntity.swiftÓ U  V W X€ €€3_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/Model/GameDetailModel.swiftÓ U  V W X€ €€5_vfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/LocaleGameDataSource.swiftÓ U  V W X€ €€7_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Remote/RemoteDataSource.swiftÓ U  V W X€ €€9_}file:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Remote/Response/GameDetailResponse.swiftÓ U  V W X€ €€;_pfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/Model/CategoryModel.swiftÓ U  V W X € €€=_wfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Utils/Extensions/CustomeError+Ext.swiftÓ U  V W X%€ €€?_sfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/HomeInteractor.swiftÓ U  V W X*€ €€A_mfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Utils/Mapper/MealMapper.swiftÓ U  V W X/€ €€C_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Search/Router/SearchRouter.swiftÓ U  V W X4€ €€E_vfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Favorite/Router/FavoriteRouter.swiftÓ U  V W X9€ €€G_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/LocaleDataSource.swiftÓ U  V W X>€ €€I_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/Model/IngredientModel.swiftÓ U  V W XC€ €€K_nfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Detail/View/DetailView.swiftÓ U  V W XH€ €€M_wfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/FavoriteInteractor.swiftÓ U  V W XM€ €€O_lfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/Model/GameModel.swiftÓ U  V W XR€ €€Q_bfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/DI/Injection.swiftÓ U  V W XW€ €€S_cfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/App/TheMealsAppApp.swiftÓ U  V W X\€ €€U_|file:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Favorite/Presenter/FavoritePresenter.swiftÓ U  V W Xa€ €€W_sfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/GameEntity.swiftÓ U  V W Xf€ €€Y_xfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Remote/Response/GamesResponse.swiftÓ U  V W Xk€ €€[_jfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/GameRespository.swiftÓ U  V W Xp€ €€]_xfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Search/Presenter/SearchPresenter.swiftÓ U  V W Xu€ €€__pfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Utils/View/CustomEmptyView.swiftÓ U  V W Xz€ €€a_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Detail/Router/DetailRouter.swiftÓ U  V W X€ €€c_lfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/Model/MealModel.swiftÓ U  V W X„€ €€e_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Favorite/View/FavoriteView.swiftÓ U  V W X‰€ €€g_pfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/Model/GameModel%202.swiftÓ U  V W X€ €€i_nfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Search/View/SearchView.swiftÓ U  V W X“€ €€k_ufile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/SearchInteractor.swiftÓ U  V W X˜€ €€m_qfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/Untitled.swiftÓ U  V W X€ €€o_xfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Detail/Presenter/DetailPresenter.swiftÓ U  V W X¢€ €€q_ufile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/DetailInteractor.swiftÓ U  V W X§€ €€s_wfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/CategoryEntity.swiftÓ U  V W X¬€ €€u_wfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/GameEntity%202.swiftÓ U  V W X±€ €€w_yfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/IngredientEntity.swiftÓ   ´¿ 8ªµ¶·¸¹º»¼½¾€y€z€{€|€}€~€€€€€‚ªÀ 0ÂÂÄÅ .ÂÈ 0€ƒ€†€‡€‡€ˆ€™€…€‡€š€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  Ö S¡×€„€)Ò  Ú S¤ . . . .€…€…€…€…€) 	Ó   äç ¢åæ€‰€Š¢èé€‹€”€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   îò £ïğñ€Œ€€£óôõ€€‘€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒû üı\NS.uuidbytesO!víÛ<Iº–ñxİŞ4U€Ò \ ]ÿ VNSUUID¢ÿ `Ò ı\NS.uuidbytesO¥¤8‰ÎI¾àc¼:Ö4€#@d      Ò \ ]\NSDictionary¢ `Ó   
+ ¢€•€–¢€—€˜€“[lineIndexes^documentLengthÒ   S €)U#        Ó    ¢€›€œ¢€—€˜€“Ufolds^documentLengthÒ \ ]#$_NSMutableDictionary£# `Ó   &1 8ª'()*+,-./0€Ÿ€ €¡€¢€£€¤€¥€¦€§€¨ª2 0ÂÂ67 .Â: 0€©€†€‡€‡€«€·€…€‡€¸€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  H S¡I€ª€)Ò  L S¤ . . . .€…€…€…€…€)Ó   SV ¢TU€¬€­¢WX€®€´€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ]a £^_`€¯€°€±£bcõ€²€³€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒj kı\NS.uuidbytesOV´	MDşw ÷)^Z9€Òn oı\NS.uuidbytesOáA½^$lC´€ŒIã|aİ€Ó   ru ¢s€µ€•¢v€¶€—€“^documentLengthò#¿ğ      Ó   }€ ¢€›€¹¢v€—€¶€“^documentLengthÓ   †‘ 8ª‡ˆ‰Š‹Œ€»€¼€½€¾€¿€À€Á€Â€Ã€Äª’ 0ÂÂ–—˜Âš 0€Å€†€‡€‡€Ê€×€Ø€‡€Ù€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ¨ S¡©€Æ€)Ò  ¬ S¤­®¯ .€Ç€È€É€…€)eqÓ   ¶¹ ¢·¸€Ë€Ì¢º»€Í€Ó€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ÀÄ £ÁÂÃ€Î€Ï€Ğ£ÅõÇ€Ñ€’€Ò€“_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒÍ Îı\NS.uuidbytesO6–\×¸zLÕ¬ºl'^#·õ€ÒÑ Òı\NS.uuidbytesOügª¶m¢E¾¤*-ª¸,¡€Ó   ÕØ ¢×€•€Ô¢ÙÚ€Õ€Ö€“^documentLengthÒ  Ş S €)•#@      FÓ   äç ¢æ€›€Ú¢ÙÚ€Õ€Ö€“^documentLengthÓ   íø 8ªîïğñòóôõö÷€Ü€İ€Ş€ß€à€á€â€ã€ä€åªù 0ÂÂıÅ .Â 0€æ€†€‡€‡€ê€™€…€‡€ö€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ   S¡€ç€)Ò   S¤€è€é€è€é€)KÓ    ¢€ë€ì¢ !€í€ó€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   &* £'()€î€ï€ğ£+õ-€ñ€’€ò€“_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒ3 4ı\NS.uuidbytesO»ÎC7ËÀEş…Ÿ; ?•¤€Ò7 8ı\NS.uuidbytesOPæÿ«ĞGOÀ†Lèt0æv€Ó   ;> ¢=€•€ô¢Ù@€Õ€õ€“^documentLengthFÓ   EH ¢G€›€÷¢Ù@€Õ€õ€“^documentLengthÓ   NY 8ªOPQRSTUVWX€ù€ú€û€ü€ı€ş€ÿ ªZ 0ÂÂ^7 .Âb 0€†€‡€‡€·€…€‡€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  p S¡q€)Ò  t S¤uvuv€)fÓ   }€ ¢~	¢‚
+€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ‡Š ¢‰€•¢ÙŒ€Õ€“^documentLength	_Ó   ‘• £’“”£–õ˜€’€“_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒ Ÿı\NS.uuidbytesOoİ–oÍ"Jn£ÈçTñº!€Ò¢ £ı\NS.uuidbytesOrubY®bJs§¨ÜvFñ‡€Ó   ¦© ¢¨€›¢ÙŒ€Õ€“^documentLengthÓ   ¯º 8ª°±²³´µ¶·¸¹ª» 0ÂÂ¿ÀÁÂÃ 0 €†€‡€‡#/0€‡1€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  Ñ S¡Ò!€)Ò  Õ S¤ÖvÖv""€)LÓ   İà ¢Şß$%¢áâ&,€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   çë £èéê'()£õíî€’*+€“_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒô õı\NS.uuidbytesO—×,Ó	şM=©’3&^Pì€Òø ùı\NS.uuidbytesOjm¼‹6@Ã›öğxDŞ€Ó   üÿ ¢ş€•-¢Ù€Õ.€“^documentLength	f#@1      Ó    ¢
+€›2¢Ù€Õ.€“^documentLengthÓ    8ª456789:;<=ª 0ÂÂ!7 .Â% 0>€†€‡€‡@€·€…€‡L€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  3 S¡4?€)Ò  7 S¤ . . . .€…€…€…€…€)Ó   >A ¢?@AB¢BCCI€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   HL £IJKDEF£MNõGH€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒU Vı\NS.uuidbytesONx\µšAN±š’`Ù<J	Í€ÒY Zı\NS.uuidbytesO×˜Š°ãÚCP¯cZVá€Ó   ]` ¢^J€•¢aK€—€“^documentLengthøÓ   gj ¢i€›M¢a€—K€“^documentLengthÓ   p{ 8ªqrstuvwxyzOPQRSTUVWXª| 0ÂÂ€Å .Â„ 0Y€†€‡€‡\€™€…€‡h€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ’ S¡“Z€)Ò  – S¤Á˜Á˜0[0[€)Ó   ¡ ¢Ÿ ]^¢¢£_b€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ¨« ¢©`€•¢¬Ùa€Õ€“^documentLength³Ó   ²¶ £³´µcde£·¸õfg€’€“_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.widthÒ¿ Àı\NS.uuidbytesOÎL(¤9DF²»ÈÑ¼íû€ÒÃ Äı\NS.uuidbytesOU·÷¿OºMòúºœãn'ü€Ó   ÇÊ ¢É€›i¢Ù¬€Õa€“^documentLengthÓ   ĞÛ 8ªÑÒÓÔÕÖ×ØÙÚklmnopqrstªÜ 0ÂÂàáâÂä 0u€†€‡€‡y…†€‡‡€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ò S¡óv€)Ò  ö S¤÷ø÷øwxwx€)GÓ   ÿ ¢ z{¢|‚€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   	 £
+}~£õ€€’€“_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒ ı\NS.uuidbytesOÍ>¥KhXLÒ¯lÕà‘õŸ½€Ò ı\NS.uuidbytesO/‰È08@cîø¨Ğ€Ó   ! ¢ €•ƒ¢Ù#€Õ„€“^documentLength##?ğ      Ó   *- ¢,€›ˆ¢Ù#€Õ„€“^documentLengthÓ   3> 8ª456789:;<=Š‹Œ‘’“ª? 0ÂÂC7 .ÂG 0”€†€‡€‡—€·€…€‡£€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  U S¡V•€)Ò  Y S¤ZvZv––€)Ó   ad ¢bc˜™¢efš€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   kn ¢l›€•¢oÙœ€Õ€“^documentLengthÓÓ   uy £vwxŸ £z{õ¡¢€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ‚ ƒı\NS.uuidbytesO£ö<ó"Kjª`P[: €Ò† ‡ı\NS.uuidbytesOüë×o‘ÍK)ˆ·èÙ#pùK€Ó   Š ¢Œ€›¤¢Ùo€Õœ€“^documentLengthÓ   “ 8ª”•–—˜™š›œ¦§¨©ª«¬­®¯ªŸ 0ÂÂ£¤¥Â§ 0°€†€‡€‡²¾¿€‡À€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  µ S¡¶±€)Ò  ¹ S¤ . . . .€…€…€…€…€)Ó   ÀÃ ¢ÁÂ³´¢ÄÅµ»€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ÊÎ £ËÌÍ¶·¸£ÏĞõ¹º€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ× Øı\NS.uuidbytesOßIŸ0>éKÜ­(ğ›d¹sk€ÒÛ Üı\NS.uuidbytesOÜ~·BO›ITÒ\W‚€Ó   ßâ ¢à¼€•¢ã½€—€“^documentLength€#@,      ”Ó   ëî ¢í€›Á¢ã€—½€“^documentLengthÓ   ôÿ 8ªõö÷øùúûüışÃÄÅÆÇÈÉÊËÌª  0ÂÂ7 .Â 0Í€†€‡€‡Ğ€·€…€‡Ü€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ   S¡Î€)Ò   S¤vvÏÏ€)Ó   "% ¢#$ÑÒ¢&'ÓÖ€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ,/ ¢.€•Ô¢Ù1€ÕÕ€“^documentLengthfÓ   6: £789×ØÙ£õ<=€’ÚÛ€“_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStoreÒC Dı\NS.uuidbytesONàÇ4ÖjD×£ÄÒC{b¡€ÒG Hı\NS.uuidbytesO+•Ë™lÃ@İ¿*=_i0GD€Ó   KN ¢M€›İ¢Ù1€ÕÕ€“^documentLengthÓ   T_ 8ªUVWXYZ[\]^ßàáâãäåæçèª` 0ÂÂd7 .Âh 0é€†€‡€‡ë€·€…€‡÷€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  v S¡wê€)Ò  z S¤vvÏÏ€)Ó   „ ¢‚ƒìí¢…†îô€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ‹ £Œïğñ£õ‘’€’òó€“_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStoreÒ˜ ™ı\NS.uuidbytesO·#ŞæIš·Yí@ûûz€Òœ ı\NS.uuidbytesO	Ÿ•&ìL¬dW¦"áw	€Ó    £ ¢¢€•õ¢Ù¥€Õö€“^documentLengthjÓ   ª­ ¢¬€›ø¢Ù¥€Õö€“^documentLengthÓ   ³¾ 8ª´µ¶·¸¹º»¼½úûüışÿ ª¿ 0ÂÂÃÄÅÂÇ 0€†€‡€‡€‡€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  Õ S¡Ö€)Ò  Ù S¤ÚÛÚÛ€)Ó   âå ¢ãä	
+¢æç€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ìğ £íîï£õòó€’€“_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒù úı\NS.uuidbytesOë._şgII©¸†Äk1M€Òı şı\NS.uuidbytesOyiWùç AJ‰õ#Nñ–m€Ó    ¢€•¢Ù€Õ€“^documentLength±#@*      Ó    ¢€›¢Ù€Õ€“^documentLengthÓ   ! 8ª  !"ª" 0ÂÂ&—(Â* 0#€†€‡€‡'€×3€‡4€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  8 S¡9$€)Ò  < S¤=>=>%&%&€)¡+Ó   EH ¢FG()¢IJ*-€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   OR ¢P+€•¢SÙ,€Õ€“^documentLength3ôÓ   Y] £Z[\./0£^_õ12€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒf gı\NS.uuidbytesO/¹µ!]GJ³øAS`6]€Òj kı\NS.uuidbytesO~ÕœS×J$¦¼+My{SV€†Ó   or ¢q€›5¢ÙS€Õ,€“^documentLengthÓ   xƒ 8ªyz{|}~€‚789:;<=>?@ª„ 0ÂÂˆ7 .ÂŒ 0A€†€‡€‡C€·€…€‡O€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  š S¡›B€)Ò   S¤ . . . .€…€…€…€…€)Ó   ¥¨ ¢¦§DE¢©ªFL€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ¯³ £°±²GHI£´µõJK€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ¼ ½ı\NS.uuidbytesOÍÚ{-–‡AŒd€;ÔV&€ÒÀ Áı\NS.uuidbytesO§^ÌöDÆ·yèà8÷'€Ó   ÄÇ ¢Æ€•M¢É€—N€“^documentLengthãÓ   ÎÑ ¢Ğ€›P¢É€—N€“^documentLengthÓ   ×â 8ªØÙÚÛÜİŞßàáRSTUVWXYZ[ªã 0ÂÂç¤ÅÂë 0\€†€‡€‡`¾€‡l€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ù S¡ú]€)Ò  ı S¤şÿşÿ^_^_€)!Ó   	 ¢ab¢
+ci€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ    £def£õgh€’€“_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.widthÒ ı\NS.uuidbytesO£z—ñKOªüæX,1€Ò! "ı\NS.uuidbytesOBÜk„Eîë/häØÜŒ€Ó   %( ¢'€•j¢Ù*€Õk€“^documentLengthÓ   /2 ¢1€›m¢Ù*€Õk€“^documentLengthÓ   8C 8ª9:;<=>?@ABopqrstuvwxªD 0ÂÂHÅ .ÂL 0y€†€‡€‡|€™€…€‡ˆ€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  Z S¡[z€)Ò  ^ S¤_v_v{{€)©Ó   fi ¢gh}~¢jk…€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   pt £qrs€‚£uvõƒ„€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ} ~ı\NS.uuidbytesOòI_À
+nKñXŸ„Mp?Ò€Ò ‚ı\NS.uuidbytesOB+ÎÌ›Dc“cpx)‰ù€Ó   …ˆ ¢‡€•†¢ÙŠ€Õ‡€“^documentLengthÓ   ’ ¢‘€›‰¢ÙŠ€Õ‡€“^documentLengthÓ   ˜£ 8ª™š›œŸ ¡¢‹Œ‘’“”ª¤ 0ÂÂ¨7 .Â¬ 0•€†€‡€‡—€·€…€‡£€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  º S¡»–€)Ò  ¾ S¤Ú®Ú®€È€È€)Ó   ÅÈ ¢ÆÇ˜™¢ÉÊš €“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ÏÓ £ĞÑÒ›œ£ÔÕõŸ€’€“_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.widthÒÜ İı\NS.uuidbytesO@jH«á3IM¬" TÛ¡pz€Òà áı\NS.uuidbytesOpSz…n Bl ÂC)TÍ*€Ó   äç ¢å¡€•¢èÙ¢€Õ€“^documentLengthbÓ   îñ ¢ğ€›¤¢Ùè€Õ¢€“^documentLengthÓ   ÷	 8ªøùúûüışÿ	 	¦§¨©ª«¬­®¯ª	 0ÂÂ	7 .Â	 0°€†€‡€‡²€·€…€‡¾€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  	 S¡	±€)Ò  	 S¤ZvZv––€)Ó   	$	' ¢	%	&³´¢	(	)µ¸€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   	.	1 ¢	0€•¶¢Ù	3€Õ·€“^documentLengthûÓ   	8	< £	9	:	;¹º»£	=õ	?¼€’½€“_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒ	E 	Fı\NS.uuidbytesO‡ip÷¼ûN®…şÕLM_€Ò	I 	Jı\NS.uuidbytesO.,qFÏJ^‰¼åH
+ùØ€Ó   	M	P ¢	O€›¿¢Ù	3€Õ·€“^documentLengthÓ   	V	a 8ª	W	X	Y	Z	[	\	]	^	_	`ÁÂÃÄÅÆÇÈÉÊª	b 0ÂÂ	fÀ	hÂ	j 0Ë€†€‡€‡Î/Ú€‡Û€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  	x S¡	yÌ€)Ò  	| S¤	} .	} .Í€…Í€…€) Ó   	„	‡ ¢	…	†ÏĞ¢	ˆ	‰ÑÔ€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   		‘ ¢	€•Ò¢Ù	“€ÕÓ€“^documentLengthäÓ   	˜	œ £	™	š	›ÕÖ×£õ		Ÿ€’ØÙ€“_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒ	¥ 	¦ı\NS.uuidbytesOŸ~¾ B©œ¡/UA€Ò	© 	ªı\NS.uuidbytesOœÿ¢NN£®$]ãçj€	Ó   	®	± ¢	°€›Ü¢Ù	“€ÕÓ€“^documentLengthÓ   	·	Â 8ª	¸	¹	º	»	¼	½	¾	¿	À	ÁŞßàáâãäåæçª	Ã 0ÂÂ	Ç7 .Â	Ë 0è€†€‡€‡ë€·€…€‡÷€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  	Ù S¡	Úé€)Ò  	İ S¤	Şv	Şvêê€),Ó   	å	è ¢	æ	çìí¢	é	êîñ€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   	ï	ò ¢	ğï€•¢	óÙğ€Õ€“^documentLengthˆÓ   	ù	ı £	ú	û	üòóô£	şõ
+ õ€’ö€“_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒ
+ 
+ı\NS.uuidbytesOò"Ö¯¹O°-J<æÆIü€Ò
+
+ 
+ı\NS.uuidbytesOpYXÖK7Bğ›Ñò®ô4€Ó   
+
+ ¢
+€›ø¢Ù	ó€Õğ€“^documentLengthÓ   
+
+" 8ª
+
+
+
+
+
+
+
+
+ 
+!úûüışÿ ª
+# 0ÂÂ
+'Å .Â
++ 0€†€‡€‡€™€…€‡€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  
+9 S¡
+:€)Ò  
+= S¤
+>v
+>v€))Ó   
+E
+H ¢
+F
+G	¢
+I
+J
+€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   
+O
+R ¢
+Q€•¢Ù
+T€Õ€“^documentLength@Ó   
+Y
+] £
+Z
+[
+\£
+^õ
+`€’€“_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒ
+f 
+gı\NS.uuidbytesOÿ'#³>6K{¹°*Úöò#€Ò
+j 
+kı\NS.uuidbytesO¨LvÛæuJ<­™P·V¾ñ€Ó   
+n
+q ¢
+p€›¢Ù
+T€Õ€“^documentLengthÓ   
+w
+‚ 8ª
+x
+y
+z
+{
+|
+}
+~
+
+€
+ª
+ƒ 0ÂÂ
+‡7 .Â
+‹ 0 €†€‡€‡#€·€…€‡/€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  
+™ S¡
+š!€)Ò  
+ S¤
+Å
+Å""€)Ó   
+¥
+¨ ¢
+¦
+§$%¢
+©
+ª&)€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   
+¯
+² ¢
+°'€•¢
+³Ù(€Õ€“^documentLength/Ó   
+¹
+½ £
+º
+»
+¼*+,£
+¾õ
+À-€’.€“_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒ
+Æ 
+Çı\NS.uuidbytesO€êàIİ¿dÊªIÙ€Ò
+Ê 
+Ëı\NS.uuidbytesO	–^KÊCª£‹›#
+‡ü¦€Ó   
+Î
+Ñ ¢
+Ğ€›0¢Ù
+³€Õ(€“^documentLengthÓ   
+×
+â 8ª
+Ø
+Ù
+Ú
+Û
+Ü
 İ
 Ş
 ß
-é
-ê
-ë
-ì
-ğ
-ô
-ü
-ı
-ş
-ÿ !"#$%&'()*.56>?@JKLMQU]^_gh€‚ƒ„…†‡ˆ‰Š•Ÿ©ª«¬°´¼½¾¿ÇÈàáâãäåæçèéêîõöşÿ 
-'(.23?@ABCDEIOPQYZ[\]bflmnpsw}„‘—˜œŸ¥¦ª®´µ¸ĞÑÒÓÔÕÖ×ØÙÚÛÜİŞßàáäğñòóôõö÷ı	
-*+,-./23GHIJKLMNOPbcdefghiwxyz{|ˆ‰Š‹Œ‘—˜œ¢®¯°±²¶·½¾ÂÃÄÎÏĞÑÒŞßàáâãéêîïğøùúış !"#$%&,-2<=>?@AKLMQabcdefghpqr€œ¦¬­±µ¶º Ã»¿ÀÄÈÉÍÎÒÖ×Üàáâúûüışÿ !",-./37?@AENU^bcghlmqrvz{€˜™š›œŸ ¡¢¦­µ¶·ÁÂÃÄÈÌÔÕİŞßèïøüı123456789:;?FNOPZ[\]aemnvw€‡”•™š¢¦ª«¯°ÈÉÊËÌÍÎÏĞÑÒÖİåæçïğúûüı(,-159=ABFG_`abcdefghimt|}~ˆ‰Š‹“›œ¤¥¦¯¶·¼ÀÁÂÆÇÈÌÍÎÔÕÙßàáêñúşÿ23456789:;<@GOPQ[\]^bfnowxy‚‰’–—›Ÿ£§«¬°±ÉÊËÌÍÎÏĞÑÒÓ×Şæçèòóôõùı )-.237;?CDHIabcdefghijkov~€Š‹Œ‘•¦§¨±¸ÀÄÅÉÊÎÒÖ×ÛÜôõö÷øùúûüış	
-()*+/3;<=FMUYZ^_cgklpq‰Š‹Œ‘’“—¦§¨²³´µ¹½ÅÆÎÏĞÑÕÙâéñõùı
-"#$%&'()*+,07?@AKLMNRV^_ghlmt|€„ˆŒ‘•¡¢£¤¥±²³´µ»¼ÁËÌÍ×ØìíîïğñòóôõøU$nullÓ      WNS.keysZNS.objectsV$class¢  €€¢  €æ€_IDEWorkspaceDocument_$9229D32F-C4FF-43F2-A95F-816FAA71C582Ó     ) 8®        ! " # $ % & ' (€€€€€	€
-€€€€€€€€® * + , - . / 0 1 2 3 - 5 6 0€€*¡¤€‹¦€w§ª¹¤ËÌ€w€:_RecentEditorDocumentURLs_DefaultEditorStatesForURLs\ActiveScheme_ActiveProjectSetIdentifierKey_$RunDestinationArchitectureVisibility_DocumentWindows_EnableThreadGallery_WindowArrangementDebugInfo_RunContextRecents_ActiveRunDestination_ActiveProjectSetNameKey_SelectedWindows_0LastCompletedPersistentSchemeBasedActivityReport_BreakpointsActivatedÒ   H Sª I J K L M N O P Q R€€€€€€€!€#€%€'€)Ó U  V W X YWNS.base[NS.relative€ €€_bfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/DI/Injection.swiftÒ \ ] ^ _Z$classnameX$classesUNSURL¢ ^ `XNSObjectÓ U  V W X d€ €€_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Favorite/View/FavoriteView.swiftÓ U  V W X i€ €€_|file:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Favorite/Presenter/FavoritePresenter.swiftÓ U  V W X n€ €€_xfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Search/Presenter/SearchPresenter.swiftÓ U  V W X s€ €€_xfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Detail/Presenter/DetailPresenter.swiftÓ U  V W X x€ €€ _rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Detail/Router/DetailRouter.swiftÓ U  V W X }€ €€"_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Search/Router/SearchRouter.swiftÓ U  V W X ‚€ €€$_sfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/MealInteractor.swiftÓ U  V W X ‡€ €€&_vfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Favorite/Router/FavoriteRouter.swiftÓ U  V W X Œ€ €€(_2x-xcode-log://DE4259B5-7817-44E7-8091-BC59E4CDE608Ò \ ]  WNSArray¢  `Ó    ’ – 8£ “ ” •€+€,€-£ — ˜ ™€.€AŒ€:_'Xcode.IDEKit.EditorDocument.LogDocument_-Xcode.IDEKit.EditorDocument.PegasusSourceCode_7Xcode.Xcode3ProjectSupport.EditorDocument.Xcode3ProjectÓ    Ÿ ¢ 8¢   R€/€'¢ £ ¤€1€;€:Ó U  V W X ©€ €€0_2x-xcode-log://55CEB2A9-122B-4C7C-8B4C-1B6CFB5F6402Ó    ¬ ® 8¡ ­€2¡ ¯€3€:_SelectedDocumentLocationsÒ   ³ S¡ ´€4€)Õ  · ¸ ¹ º » W ½ © ¿Ytimestamp_expandTranscript[documentURLYindexPath€9€ €0€5Ó Á Â  Ã Ä Å_NSIndexPathLength_NSIndexPathData€6€8Ò Ç  È ÉWNS.dataB €7Ò \ ] Ë Ì]NSMutableData£ Ë Í `VNSDataÒ \ ] Ï Ğ[NSIndexPath¢ Ñ `[NSIndexPathÒ \ ] Ó Ô_IDELogDocumentLocation£ Õ Ö `_IDELogDocumentLocation_DVTDocumentLocationÒ \ ] Ø Ù_NSMutableDictionary£ Ø Ú `\NSDictionaryÓ    Ü Ş 8¡ İ€<¡ ß€=€:_SelectedDocumentLocationsÒ   ã S¡ ä€>€)Õ  · ¸ ¹ º » W ½ Œ ë€9€ €(€?Ó Á Â  Ã í Å€@€8Ò Ç  ğ ÉB€7Ó    ó 8¯ ô õ ö K ø ù ú û ü ı N L  M P O	
- I J Q€B€D€F€€H€J€L€N€P€R€€€T€V€X€€Z€\€^€#€!€`€b€€€d€f€%¯ !"#$%&'()*+,€h€€®€Ê€ç =\x”±Îè>Yt­Èã8Tp€:Ó U  V W X1€ €€C_sfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/GameEntity.swiftÓ U  V W X6€ €€E_mfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Utils/Mapper/GameMapper.swiftÓ U  V W X;€ €€G_wfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/FavoriteInteractor.swiftÓ U  V W X@€ €€I_wfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/GameEntity%202.swiftÓ U  V W XE€ €€K_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/Model/GameDetailModel.swiftÓ U  V W XJ€ €€M_lfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/Model/GameModel.swiftÓ U  V W XO€ €€O_ifile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/MealRepository.swiftÓ U  V W XT€ €€Q_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Remote/RemoteDataSource.swiftÓ U  V W XY€ €€S_xfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Remote/Response/GamesResponse.swiftÓ U  V W X^€ €€U_qfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/Untitled.swiftÓ U  V W Xc€ €€W_sfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/MealEntity.swiftÓ U  V W Xh€ €€Y_yfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/IngredientEntity.swiftÓ U  V W Xm€ €€[_wfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/Entity/CategoryEntity.swiftÓ U  V W Xr€ €€]_sfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/HomeInteractor.swiftÓ U  V W Xw€ €€__ufile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/SearchInteractor.swiftÓ U  V W X|€ €€a_pfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/Model/GameModel%202.swiftÓ U  V W X€ €€c_rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/Locale/LocaleDataSource.swiftÓ U  V W X†€ €€e_ufile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/DetailInteractor.swiftÓ U  V W X‹€ €€g_mfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Utils/Mapper/MealMapper.swiftÓ   ™ 8ª‘’“”•–—˜€i€j€k€l€m€n€o€p€q€rªš 0œœŸ .œ¢ 0€s€w€x€x€y€Š€‹€x€Œ€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ° S¡±€t€)Ò  ´ S¤µ¶µ¶€u€v€u€v€)	Ó   ¿Â ¢ÀÁ€z€{¢ÃÄ€|€‚€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ÉÌ ¢ÊË€}€~¢ÍÎ€€€€[lineIndexes^documentLengthÒ  Ó S €)jÒ \ ] Ú×¢ Ú `Ó   Ùİ £ÚÛÜ€ƒ€„€…£Şßà€†€‡€‰€_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStore#@d      Òç èé\NS.uuidbytesO„äŞÌ<$D!˜
-N68„€ˆÒ \ ]ëìVNSUUID¢ë `Òî ïé\NS.uuidbytesOØÌàoßE~ gßmĞ€ˆ#         Ó   ô÷ ¢õö€€¢ÍÎ€€€€Ufolds^documentLengthÓ   ş	 8ªÿ €€‘€’€“€”€•€–€—€˜€™ª
- 0œœœ 0€š€w€x€x€€ª€«€x€¬€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ    S¡!€›€)Ò  $ S¤%&%&€œ€€œ€€)ƒÓ   -0 ¢./€Ÿ€ ¢12€¡€¤€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   7: ¢8Ê€¢€}¢;Í€£€€^documentLengthSÓ   AE £BCD€¥€¦€§£FŞH€¨€†€©€_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒN Oé\NS.uuidbytesO³&~ªïJŒgßlSÍ„?€ˆÒR Sé\NS.uuidbytesO®ØA‚¢L ±Î!58ú€ˆ#@      }Ó   X[ ¢õZ€€­¢Í;€€£€^documentLengthÓ   al 8ªbcdefghijk€¯€°€±€²€³€´€µ€¶€·€¸ªm 0œœqŸ .œu 0€¹€w€x€x€»€Š€‹€x€È€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ƒ S¡„€º€)Ò  ‡ S¤ . . . .€‹€‹€‹€‹€)Ó   ‘ ¢€¼€½¢’“€¾€Ä€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ˜œ £™š›€¿€À€Á£Ş€Â€Ã€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ¥ ¦é\NS.uuidbytesO·bæ›W=D=¿‹‡øİhƒ€ˆÒ© ªé\NS.uuidbytesO‘v¯E¤¶ìnÌN€ˆÓ   ­° ¢®Ê€Å€}¢±²€Æ€Ç€^documentLengthÒ  · S €)Ó   º½ ¢õ¼€€É¢²±€Ç€Æ€^documentLengthÓ   ÃÎ 8ªÄÅÆÇÈÉÊËÌÍ€Ë€Ì€Í€Î€Ï€Ğ€Ñ€Ò€Ó€ÔªÏ 0œœÓŸ .œ× 0€Õ€w€x€x€Ù€Š€‹€x€å€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  å S¡æ€Ö€)Ò  é S¤êëêë€×€Ø€×€Ø€)0KÓ   òõ ¢óô€Ú€Û¢ö÷€Ü€â€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ü  £ışÿ€İ€Ş€ß£Ş€†€à€á€_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒ	 
-é\NS.uuidbytesO$‘çCû…îLğAñ`ë€ˆÒ é\NS.uuidbytesOİ;Øz"C0œ ·.5o€ˆÓ    ¢Ê€}€ã¢Í€€ä€^documentLength+Ó    ¢õ€€æ¢Í€€ä€^documentLengthÓ   $/ 8ª%&'()*+,-.€è€é€ê€ë€ì€í€î€ï€ğ€ñª0 0œœ4Ÿ .œ8 0€ò€w€x€x€ö€Š€‹€x€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  F S¡G€ó€)Ò  J S¤KLKL€ô€õ€ô€õ€)
-Ó   SV ¢TU€÷€ø¢WX€ù€ÿ€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ]a £^_`€ú€û€ü£Şcd€†€ı€ş€_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒj ké\NS.uuidbytesOèU^q3[Bºˆ	.iiÊ×€ˆÒn oé\NS.uuidbytesO£ƒÔbˆOp¯áóÙüa²D€ˆÓ   ru ¢sÊ €}¢vÍ€€^documentLength$Ó   | ¢õ~€¢Ív€€^documentLengthÓ   … 8ª†‡ˆ‰Š‹Œ	
-ª‘ 0œœ•– .œ™ 0€w€x€x€‹€x€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  § S¡¨€)Ò  « S¤ . . . .€‹€‹€‹€‹€)Ó   ²µ ¢³´¢¶·€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ¼À £½¾¿£ÁŞÃ€†€_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒÉ Êé\NS.uuidbytesOV´	MDşw ÷)^Z9€ˆÒÍ Îé\NS.uuidbytesOáA½^$lC´€ŒIã|aİ€ˆÓ   ÑÔ ¢ÒÊ€}¢ÕÍ€€^documentLengthò#¿ğ      Ó   Üß ¢õŞ€¢ÍÕ€€^documentLengthÓ   åğ 8ªæçèéêëìíîï!"#$%&'()*ªñ 0œœõ– .œù 0+€w€x€x/€‹€x;€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ   S¡,€)Ò   S¤-.-.€)Ó    ¢01¢25€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ! ¢Ê €}3¢Í#€4€^documentLengthÓ   (, £)*+678£-.Ş9:€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ5 6é\NS.uuidbytesOHïÑßB2²5{n61p€ˆÒ9 :é\NS.uuidbytesO¶vštK³‰ço;h€ˆÓ   =@ ¢õ?€<¢Í#€4€^documentLengthÓ   FQ 8ªGHIJKLMNOP>?@ABCDEFGªR 0œœVWXœZ 0H€w€x€xLXY€xZ€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  h S¡iI€)Ò  l S¤mnmnJKJK€)=Ó   ux ¢vwMN¢yzOU€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ƒ £€‚PQR£„…ŞST€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒŒ é\NS.uuidbytesOò ±ŠøIî“dl«À—¶€ˆÒ ‘é\NS.uuidbytesO"êøZiI…ˆ”q-l(×€ˆÓ   ”— ¢•ÊV€}¢˜ÍW€€^documentLengthí#@       8Ó    £ ¢õ¢€[¢Í˜€W€^documentLengthÓ   ©´ 8ªª«¬­®¯°±²³]^_`abcdefªµ 0œœ¹Ÿ .œ½ 0g€w€x€xj€Š€‹€xv€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  Ë S¡Ìh€)Ò  Ï S¤ĞëĞëi€Øi€Ø€)Ó   ×Ú ¢ØÙkl¢ÛÜms€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   áå £âãänop£Şçè€†qr€_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒî ïé\NS.uuidbytesO?sVêINÍj”G=ã`€ˆÒò óé\NS.uuidbytesO6†ÜÌ'N'¯¥ìe¡ÃÖ€ˆÓ   öù ¢÷Êt€}¢úÍu€€^documentLengthFÓ     ¢õ€w¢Íú€u€^documentLengthÓ   	 8ª
-yz{|}~€‚ª 0œœ– .œ 0ƒ€w€x€x†€‹€x’€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  + S¡,„€)Ò  / S¤0000…………€)Ó   7: ¢89‡ˆ¢;<‰€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   AE £BCDŠ‹Œ£FŞH€†€_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒN Oé\NS.uuidbytesOƒo–¸K‹œ·‚ÍŠÔX€ˆÒR Sé\NS.uuidbytesO3·|<ÛÚB‚µ„×ºªïkä€ˆÓ   VY ¢ÊX€}¢Í[€‘€^documentLengthÓ   `c ¢õb€“¢Í[€‘€^documentLengthÓ   it 8ªjklmnopqrs•–—˜™š›œªu 0œœy– .œ} 0Ÿ€w€x€x£€‹€x¯€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ‹ S¡Œ €)Ò   S¤‘‘¡¢¡¢€)CÓ   ˜› ¢™š¤¥¢œ¦¬€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ¢¦ ££¤¥§¨©£§Ş©ª€†«€_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒ¯ °é\NS.uuidbytesOY”×ËpC†„ŞÇgXä9©€ˆÒ³ ´é\NS.uuidbytesOa;¼Æ ²Hİ‚‘=ãŸœß€ˆÓ   ·º ¢Ê¹€}­¢Í¼€®€^documentLengthÓ   ÁÄ ¢õÃ€°¢Í¼€®€^documentLengthÓ   ÊÕ 8ªËÌÍÎÏĞÑÒÓÔ²³´µ¶·¸¹º»ªÖ 0œœÚœŞ 0¼€w€x€xÀ€ª¡€xÌ€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ì S¡í½€)Ò  ğ S¤ñòñò¾¿¾¿€)/Ó   ùü ¢úûÁÂ¢ışÃÉ€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ    £ÄÅÆ£Ş	
-€†ÇÈ€_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStoreÒ é\NS.uuidbytesOwÙ0•"}F~™êf5ít€ˆÒ é\NS.uuidbytesO“ºKÿÎvJ8£æâ‘/½6€ˆÓ    ¢ÊÊ€}¢ÍË€€^documentLength1Ó   "% ¢õ$€Í¢Í€Ë€^documentLengthÓ   +6 8ª,-./012345ÏĞÑÒÓÔÕÖ×Øª7 0œœ;– .œ? 0Ù€w€x€xÛ€‹€xæ€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  M S¡NÚ€)Ò  Q S¤ . . . .€‹€‹€‹€‹€)Ó   X[ ¢YZÜİ¢\]Şä€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   bf £cdeßàá£ghŞâã€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒo pé\NS.uuidbytesO*ExVåE …¨>û D€ˆÒs té\NS.uuidbytesOo{Q'¹ÄOóŸ4Z V9°€ˆÓ   wz ¢xÊå€}¢¶²€v€Ç€^documentLengthÓ   €ƒ ¢õ‚€ç¢²¶€Ç€v€^documentLengthÓ   ‰” 8ªŠ‹Œ‘’“éêëìíîïğñòª• 0œœ™Ÿ .œ 0ó€w€x€xõ€Š€‹€x€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  « S¡¬ô€)Ò  ¯ S¤ . . . .€‹€‹€‹€‹€)Ó   ¶¹ ¢·¸ö÷¢º»øş€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ÀÄ £ÁÂÃùúû£ŞÆÇ€†üı€_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒÍ Îé\NS.uuidbytesO!víÛ<Iº–ñxİŞ4U€ˆÒÑ Òé\NS.uuidbytesO¥¤8‰ÎI¾àc¼:Ö4€ˆÓ   ÕØ ¢Ê×€}ÿ¢ÍÚ€ €^documentLengthUÓ   ßâ ¢õá€¢ÍÚ€ €^documentLengthÓ   èó 8ªéêëìíîïğñò	
-ªô 0œœø– .œü 0€w€x€x€‹€x€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  
- S¡€)Ò   S¤KK€ô€ô€) Ó    ¢¢€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ    # ¢!Ê€}¢$Í€€^documentLengthÓ   *. £+,-£Ş01€†€_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒ7 8é\NS.uuidbytesOœpS<¦K¬©L¥wh­€ˆÒ; <é\NS.uuidbytesOÅåB«:YGı§ï ŸàÇ€ˆÓ   ?B ¢õA€¢Í$€€^documentLengthÓ   HS 8ªIJKLMNOPQR !"#$%&'()ªT 0œœXYZœ\ 0*€w€x€x.:;€x<€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  j S¡k+€)Ò  n S¤opop,-,-€)4Ó   wz ¢xy/0¢{|14€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   „ ¢Êƒ€}2¢Í†€3€^documentLengthfÓ   ‹ £Œ567£‘Ş89€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ˜ ™é\NS.uuidbytesOQÙ°ÊT@U¾_8(ÌÙ`€ˆÒœ é\NS.uuidbytesO¥Æ;÷@8—ü.íG>ò€ˆ#@*      Ó   ¢¥ ¢õ¤€=¢Í†€3€^documentLengthÓ   «¶ 8ª¬­®¯°±²³´µ?@ABCDEFGHª· 0œœ»– .œ¿ 0I€w€x€xK€‹€xW€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  Í S¡ÎJ€)Ò  Ñ S¤ . . . .€‹€‹€‹€‹€)Ó   ØÛ ¢ÙÚLM¢ÜİNQ€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   âå ¢ãÊO€}¢æÍP€€^documentLength„Ó   ìğ £íîïRST£ñòŞUV€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒù úé\NS.uuidbytesO|RõqïÖBî ³Vøcî€ˆÒı şé\NS.uuidbytesOÏİé5Ö#B$˜n¿Oò¾Ú€ˆÓ    ¢õ€X¢Íæ€P€^documentLengthÓ   
- 8ªZ[\]^_`abcª 0œœŸ .œ 0d€w€x€xf€Š€‹€xr€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  , S¡-e€)Ò  0 S¤ . . . .€‹€‹€‹€‹€)Ó   7: ¢89gh¢;<il€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   AD ¢ÊC€}j¢²F€Çk€^documentLength Ó   KO £LMNmno£PQŞpq€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒX Yé\NS.uuidbytesO{Ö;¡îF±¹çÊ]É¾€ˆÒ\ ]é\NS.uuidbytesOè2•'"^D‰71—ÆË%€ˆÓ   `c ¢õb€s¢²F€Çk€^documentLengthÓ   it 8ªjklmnopqrsuvwxyz{|}~ªu 0œœyŸ .œ} 0€w€x€x€Š€‹€x€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ‹ S¡Œ€€)Ò   S¤ . .€‹€‹€)Ó   –™ ¢—˜‚ƒ¢š›„‡€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ    £ ¢Ê¢€}…¢Í¥€†€^documentLengthÓ   ª® £«¬­ˆ‰Š£Ş°±€†‹Œ€_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStoreÒ· ¸é\NS.uuidbytesOÅR9³ı¡C0 2b?ï€ˆÒ» ¼é\NS.uuidbytesOº‰—5J±½(“Ó}Q7€ˆÓ   ¿Â ¢õÁ€¢Í¥€†€^documentLengthÓ   ÈÓ 8ªÉÊËÌÍÎÏĞÑÒ‘’“”•–—˜™ªÔ 0œœØÙÚœÜ 0š€w€x€x©ª€x«€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ê S¡ë›€)Ò  î S¤ï .ï .œ€‹œ€‹€)&Ó   öù ¢÷øŸ¢úû £€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   	 	 ¢Ê	€}¡¢Í	€¢€^documentLength{Ó   	
-	 £			¤¥¦£	Ş	§€†¨€_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒ	 	é\NS.uuidbytesOé&‡ı©ÛD¨µ&Bu×æ€ˆÒ	 	é\NS.uuidbytesO>ä”™KüMğ²åÛíñ€³€ˆ#@,      Ó   	!	$ ¢õ	#€¬¢Í	€¢€^documentLengthÓ   	*	5 8ª	+	,	-	.	/	0	1	2	3	4®¯°±²³´µ¶·ª	6 0œœ	:– .œ	> 0¸€w€x€xº€‹€xÆ€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  	L S¡	M¹€)Ò  	P S¤Z¶Z¶;€v;€v€)Ó   	W	Z ¢	X	Y»¼¢	[	\½À€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   	a	d ¢Ê	c€}¾¢Í	f€¿€^documentLength’Ó   	k	o £	l	m	nÁÂÃ£Ş	q	r€†ÄÅ€_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒ	x 	yé\NS.uuidbytesOQ´Ğ$nO““C7Œé«€ˆÒ	| 	}é\NS.uuidbytesOö='£%SAÛ»Ú<Ñçİ€ˆÓ   	€	ƒ ¢õ	‚€Ç¢Í	f€¿€^documentLengthÓ   	‰	” 8ª	Š	‹	Œ					‘	’	“ÉÊËÌÍÎÏĞÑÒª	• 0œœ	™– .œ	 0Ó€w€x€xÕ€‹€xá€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  	« S¡	¬Ô€)Ò  	¯ S¤ . . . .€‹€‹€‹€‹€)Ó   	¶	¹ ¢	·	¸Ö×¢	º	»ØÛ€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   	À	Ã ¢Ê	Â€}Ù¢Í	Å€Ú€^documentLength±Ó   	Ê	Î £	Ë	Ì	ÍÜİŞ£	ÏŞ	Ñß€†à€_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒ	× 	Øé\NS.uuidbytesOœÆ#ï?Jƒ¢óøè‚Ñğ,€ˆÒ	Û 	Üé\NS.uuidbytesO&ş,•”‹KÌ¡ÓşMT¡Eï€ˆÓ   	ß	â ¢õ	á€â¢Í	Å€Ú€^documentLengthÓ   	è	ó 8ª	é	ê	ë	ì	í	î	ï	ğ	ñ	òäåæçèéêëìíª	ô 0œœ	ø	ù	úœ	ü 0î€w€x€xñış€xÿ€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  
-
- S¡
-ï€)Ò  
- S¤
-µ
-µğ€uğ€u€)dÓ   
-
- ¢
-
-òó¢
-
-ô÷€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   
- 
-# ¢
-!Êõ€}¢
-$Íö€€^documentLength3îÓ   
-*
-. £
-+
-,
--øùú£
-/Ş
-1û€†ü€_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒ
-7 
-8é\NS.uuidbytesO
-ÜŠ3N)HG¾súY~€ˆÒ
-; 
-<é\NS.uuidbytesO@¡ŞÌÔF6–ÃWK9ô^ €ˆ#@.      AÓ   
-A
-D ¢õ
-C€ ¢Í
-$€ö€^documentLengthÓ   
-J
-U 8ª
-K
-L
-M
-N
-O
-P
-Q
-R
-S
-T	
-ª
-V 0œœ
-ZŸ .œ
-^ 0€w€x€x€Š€‹€x€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  
-l S¡
-m€)Ò  
-p S¤nZnZK;K;€)Ó   
-w
-z ¢
-x
-y¢
-{
-|€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   
-
-„ ¢Ê
-ƒ€}¢Í
-†€€^documentLengthÓ   
-‹
- £
-Œ
-
-£
-
-‘Ş€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ
-˜ 
-™é\NS.uuidbytesOn
-WIEDŸŸ^ôé4€ˆÒ
-œ 
-é\NS.uuidbytesO	rhûííK§³ÑËıIÊØ€ˆÓ   
- 
-£ ¢õ
-¢€¢Í
-†€€^documentLengthÓ   
-©
-´ 8ª
-ª
-«
-¬
-­
-®
-¯
-°
-±
-²
-³ !"#$%&ª
-µ 0œœ
-¹
-»œ
-½ 0'€w€x€x)€ª5€x6€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  
-Ë S¡
-Ì(€)Ò  
-Ï S¤‘X‘X¢Y¢Y€)Ó   
-Ö
-Ù ¢
-×
-Ø*+¢
-Ú
-Û,2€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   
 à
-ä £
-á
-â
-ã-./£
-å
-æŞ01€†€_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.widthÒ
-í 
-îé\NS.uuidbytesOc%¾»IWµ[P­ {€ˆÒ
-ñ 
-òé\NS.uuidbytesOlZ»T+Ly£Dì]“ü9€ˆÓ   
-õ
-ø ¢Ê
-÷€}3¢Í
-ú€4€^documentLengthŠ(Ó     ¢õ€7¢Í
-ú€4€^documentLengthÓ   	 8ª
-9:;<=>?@ABª 0œœŸ .œ 0C€w€x€xF€Š€‹€xR€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  + S¡,D€)Ò  / S¤
-»1
-»15E5E€)@Ó   7: ¢89GH¢;<IO€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   AE £BCDJKL£ŞGH€†MN€_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒN Oé\NS.uuidbytesOö;vfSjDï¹ÆğÑ÷êÕü€ˆÒR Sé\NS.uuidbytesO<H;	¢öBÁŠÙq.©?€ˆÓ   VY ¢WÊP€}¢ZÍQ€€^documentLength—Ó   `c ¢õb€S¢ÍZ€Q€^documentLengthÓ   it 8ªjklmnopqrsUVWXYZ[\]^ªu 0œœyÙ{œ} 0_€w€x€xa©m€xn€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ‹ S¡Œ`€)Ò   S¤ . . . .€‹€‹€‹€‹€)Ó   –™ ¢—˜bc¢š›dj€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ    ¤ £¡¢£efg£¥¦Şhi€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ­ ®é\NS.uuidbytesOßIŸ0>éKÜ­(ğ›d¹sk€ˆÒ± ²é\NS.uuidbytesOÜ~·BO›ITÒ\W‚€ˆÓ   µ¸ ¢¶Êk€}¢¹²l€Ç€^documentLength€”Ó   ÀÃ ¢õÂ€o¢²¹€Çl€^documentLengthÓ   ÉÔ 8ªÊËÌÍÎÏĞÑÒÓqrstuvwxyzªÕ 0œœÙ– .œİ 0{€w€x€x~€‹€xŠ€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ë S¡ì|€)Ò  ï S¤&ñ&ñ€}€}€)Ó   ÷ú ¢øù€¢ûü‡€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ    £‚ƒ„£Ş…€††€_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒ é\NS.uuidbytesOmÚ3ßÒAB¹Ùså®öÇ€ˆÒ é\NS.uuidbytesO-ØG«÷ğJ®[0r¡=İ€ˆÓ    ¢Êˆ€}¢Í‰€€^documentLength–Ó    # ¢õ"€‹¢Í€‰€^documentLengthÓ   )+ 8¡*¡,€:Ó U  V W X1€ €_Tfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp.xcodeprojÓ   49 8¤5678‘’“¤:;<=”•– €:_-Xcode3ProjectEditorPreviousProjectEditorClass_,Xcode3ProjectEditorPreviousTargetEditorClass_,Xcode3ProjectEditorSelectedDocumentLocations_&Xcode3ProjectEditor_Xcode3TargetEditor_Xcode3ProjectInfoEditor_Xcode3TargetEditorÒ  F S¡G—€)ÔJ · ¹ KLMNYselectionš™˜Ÿ_Tfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp.xcodeproj#AÆÎªº¤©Ó   RU 8¢ST›œ¢VW€:VEditorVTarget_Xcode3TargetEditor[TheMealsAppÒ \ ]^__Xcode3ProjectDocumentLocation£`a `_Xcode3ProjectDocumentLocation_DVTDocumentLocationÓ   cd 8  €:Ó   gi ¡h¢¡j£€]IDENameString[TheMealsAppÑ o¥Ò \ ]qrVNSNull¢q `Ò  t S¡ €€)Ó   xz 8¡ €¡{¨€:Ò  ~€¡ €©Ò \ ]‚ƒ^NSMutableArray£‚  `Ó   …‰ £†‡ˆ«¬­£Š‹Œ®²¶€_IDERunContextRecentsSchemesKey_5IDERunContextRecentsLastUsedRunDestinationBySchemeKey_&IDERunContextRecentsRunDestinationsKeyÓ   ’” 8¡“¯¡•°€:[TheMealsAppÒ™ š›WNS.time#AÆÎ¹›üÒ±Ò \ ]VNSDate¢ `Ó    ¢ 8¡¡³¡£´€:[TheMealsAppÒ §¨©YNS.stringµ_;7A60B588-4926-4A88-9679-4FA36F2ECDD0_iphonesimulator_x86_64Ò \ ]«¬_NSMutableString£«­ `XNSStringÓ   ¯± 8¡°·¡²¸€:_;7A60B588-4926-4A88-9679-4FA36F2ECDD0_iphonesimulator_x86_64Ò™ ¶›#AÆÎº!»¶±Ó   ¹Ä ªº»¼½¾¿ÀÁÂÃº»¼½¾¿ÀÁÂÃª 0Æ 0œÉÊËÌÍÎ€wÄ€w€xÅÆÇÈÉÊ€ZisEligible_targetDevicePlatform_targetDeviceIsConcrete_targetDeviceIsWireless_targetSDKVariant_targetDeviceLocation_targetArchitectureYtargetSDK_targetDeviceFamily_targetDeviceModelCode_iphonesimulator_iphonesimulator_>dvtdevice-iphonesimulator:7A60B588-4926-4A88-9679-4FA36F2ECDD0Vx86_64_iphonesimulator18.2ViPhoneZiPhone17,1Ò  â€ ©Ó   åê 8¤æçèéÍÎÏĞ¤ëìíîÑÒÓÔ€:_IDEActivityReportTitle_IDEActivityReportVersion_IDEActivityReportOptions_0IDEActivityReportCompletionSummaryStringSegmentsUBuildX16C5032aêÒ  ø€£ùúûÕÚŞ©Ó   ş 8£ÿ Ö×Ø£WëXÙÑ€:_&IDEActivityReportStringSegmentPriority_+IDEActivityReportStringSegmentBackSeparator_)IDEActivityReportStringSegmentStringValueQ Ó    8£ÿ Ö×Ø£ÛÜİ€:#?ğ      c  %  Ò Ç  ÉObplist00Ô
-X$versionY$archiverT$topX$objects † _NSKeyedArchiverÑ	Troot€¯)*0:;<#=AIJKLMSWX\_U$nullÓXNSStringV$class\NSAttributes€€€VFailedÓWNS.keysZNS.objects¡€¡€€VNSFontÖ !"#$%&'(VNSSizeXNSfFlags\NSDescriptorZNSHasWidthVNSName#@&      ˆ€€€_.AppleSystemUIFontBoldÓ+,-./_NSFontDescriptorOptions_NSFontDescriptorAttributes€€„€Ó15£234€	€
-€£678€€€€_NSFontSizeAttribute_ NSCTFontFeatureSettingsAttribute_NSCTFontUIUsageAttributeÒ>@¡?€€ÓBE¢CD€€¢FG€€€_CTFeatureSelectorIdentifier_CTFeatureTypeIdentifier ÒNOPQZ$classnameX$classes\NSDictionary¢PRXNSObjectÒNOTU^NSMutableArray£TVRWNSArray_CTFontBoldUsageÒNOYZ_NSFontDescriptor¢[R_NSFontDescriptorÒNO]^VNSFont¢]RÒNO`a_NSAttributedString¢bR_NSAttributedString    $ ) 2 7 I L Q S o u | … Œ ™ ›  Ÿ ¦ ­ µ À Â Ä Æ È Ê Ñ Ş å î û 9@Zwy~€‡‹‘•—™›³Öñöøúü
-1KMOT_hux†•™¡³¸ËÎáæíğõ
-             c              "€7Ó   " 8¦ÿ !ÖßàØáâ¦#¶%&¶¶ã€väå€v€v€:_"IDEActivityReportStringSegmentType_"IDEActivityReportStringSegmentDate_'IDEActivityReportStringSegmentDateStyle_'IDEActivityReportStringSegmentTimeStyle#@      Ò™ 0›#AÆÎâz‹$±o T o d a y   a t   2 . 1 8 / A MÓ   4= 8¨56789:;<çèéêëìíî¨ 0? 0œœ< 0E€wï€w€x€xî€wğ€:_IDEWindowIsFullScreen^IDEWindowFrame_-IDEHasMigratedValuesFromNSRestorableStateData_IDEWindowTabBarIsVisible_&IDEWindowTabBarWasVisibleWithSingleTab_IDEActiveWorkspaceTabController_IDEWindowToolbarIsVisible_>IDEWorkspaceTabController_75DACF4F-9477-44F2-97BD-12677AFE5FB7_209 109 1400 900 0 0 1680 1025 Ó   QY 8§RSTUVWXñòóôõö÷§ 0[\]^œ`€wø%&*€x+€:_IDEShowNavigator_IDENavigatorArea_IDEUtilitiesWidth_IDEInspectorArea_IDENavigatorWidth_IDEShowUtilities]IDEEditorAreaÓ   jp 8¥klmnoùúûüı¥qrstuş
-€:_ Xcode.IDEKit.Navigator.Workspace_"Xcode.IDEKit.Navigator.Test.Modern_SelectedNavigator_GroupSelections_#Xcode.IDENoticesKit.NoticeNavigatorÓ   }‚ 8¤~€ÿ ¤ƒ„…ƒ€:_FilterStateByModeKey_LastNavigatorMode_UnfilterStateByModeKey_FilteredUIStateByModeKeyÓ      €_IDENavigatorModeSolitaryÓ   ’” ¡“¡•€_IDENavigatorModeSolitaryÒ ™š›_codablePlistRepresentation	OÙbplist00Ô]a_lastAccessedDateYitemState]selectedItems^scrollPosition3AÆÎµˆÅßô¯ "$&(+-1368<>@BFHJLNPSUWY[Ò	
-TpathYindexHint¥[TheMealsAppTCoreVDomainUModel Ò^expansionState3AÆÎ´œ)Q/Ò	¥TDataVLocaleÒ3AÆÎ´œ)	lÒ	¤Ò3AÆÎ´œ)AtÒ	!¥ WUseCaseÒ#3AÆÎ´œ)`kÒ	%¢Ò'3AÆÎ´œ(ÛÒ	)¦*VEntityÒ,3AÆÎ´œ)?Ò	.¥/0UUtilsVMapperÒ23AÆÎ´œ)‚Ò	4£5SAppÒ7!3AÆÎ´œIÜHÒ	9¦:;VRemoteXResponseÒ=3AÆÎ´œ)7ÊÒ	?¤ÒA3AÆÎ´œ(øŒÒ	CE¥/DWNetworkÒG3AÆÎ´œ)†MÒ	I!¥:ÒK3AÆÎ´œ)'_Ò	M!£ÒO3AÆÎ´œ(çXÒ	Q!¡R_Package DependenciesÒT3AÆÎ´œ)—‰Ò	VE¤/ÒX3AÆÎ´œ)müÒ	Z¡Ò\3AÆÎ´œ(Ç¡^Ò	_§*`_CategoryEntity.swift¢be¢cd#        #À$      ¢fg#@q      #@Ø        $ . < K T w |  ‹ ‘  ¢ © ¯ ± ¶ Å Î Ó Ù Ş å ê ó ø ı ÿ "'058=FKRY^glrx„’–šŸ¨­´»ÄÉÒ×Üáêïõıÿ&+/4=BD[`insx†ˆ–˜¥¼¿ÂËÔ×à             h              éÒ \ ]Ÿ_&ExplorableOutlineViewArchivableUIState£ ¡ `_&ExplorableOutlineViewArchivableUIState_b_TtGCV16DVTExplorableKit26ExplorableOutlineViewTypes7UIState_VS_31ExplorableStateSavingIdentifier_Ó   £¨ 8¤¤¥¦§¤©ª«©€:_FilterStateByModeKey_LastNavigatorMode_UnfilterStateByModeKey_FilteredUIStateByModeKeyÓ   ³´   €_IDENavigatorModeSolitaryÓ   ¸º ¡¹¡»€_IDENavigatorModeSolitaryÒ ¿šÁ_codablePlistRepresentation	O²bplist00Ô_lastAccessedDateYitemState]selectedItems^scrollPosition3AÆÎ¬Õ…¾  ¢	¢
-#        #À$      ¢#@q      #@Œø     $.<KTUVY\enqz                            ƒ_#Xcode.IDENoticesKit.NoticeNavigatorÓ   ÅÉ 8£ÆÇÈ£Êslú€:_%Xcode.IDEKit.NavigatorGroup.Structure_"Xcode.IDEKit.NavigatorGroup.Issues_ Xcode.IDEKit.NavigatorGroup.Test_ Xcode.IDEKit.Navigator.WorkspaceÓ   ÓØ 8¤ÔÕÖ×¤ƒÚÛƒ !€:_FilterStateByModeKey_LastNavigatorMode_UnfilterStateByModeKey_FilteredUIStateByModeKey_IDENavigatorModeSolitaryÓ   äæ ¡å"¡ç#€_IDENavigatorModeSolitaryÒ ëší_codablePlistRepresentation	$O_bplist00Ô_lastAccessedDateYitemState]selectedItems^scrollPosition3AÆÎâßòì}¤Ò	
-TpathYindexHint¢[TheMealsApp_$Missing package product 'RealmSwift' Ò^expansionState3AÆÎµˆĞùºÒ	¡Ò3AÆÎây‘pX ¢¢#        #À$      ¢#@q      #@Ø        $ . < K T Y ^ c m p | £ ¥ ª ¹ Â Ç É Î × Ø Û Ş ç ğ ó ü                           #@p@     Ó   ñô 8¢òó'(¢²ö€Ç)€:_'userPreferredInspectorGroupExtensionIDs_!userPreferredCategoryExtensionIDsÒ  û€ ©#@q      Ó   ÿ 8« 	
-,-./0123456« .7€‹89:F6?Z[\€:^MaximizedState_*BeforeComparisonMode_UserVisibleEditorMode_NavigationStyleZEditorMode_DebuggerSplitView_EditorAreaSplitStates_#primaryEditorArchivedRepresentation_IDEDefaultDebugArea_ EditorMultipleSplitPrimaryLayout_ SelectedEditorAreaSplitIndexPath_ DefaultPersistentRepresentations ZOpenInTabs Ó   ') 8¡(;¡*<€:_DVTSplitViewItemsÒ  .€¢/0=C©Ó   37 £456>?@£8 0:A€wB€]DVTIdentifier\DVTIsVisible_DVTViewMagnitudeYIDEEditor#@i`     Ó   BF £456>?@£GœID€xE€_IDEDebuggerArea#@\À     Ò  N€¡OG©Ó   RY 8¦STUVWXHIJKLM¦Z[\Z^œNON5€x€:ZEditorMode_EditorTabBarState_EditorHistoryStacks]EditorMode13+[ItemKindKey_ShouldShowPullRequestCommentsÓ   il 8¢jkPQ¢mnR€:_TabsAsHistoryItems_SelectedTabIndexÒ  s S«tuvwxyz{|}~S‰´İ.Aj’»å€)Ø‚ƒ„ …†‡ˆ‰Š‹Œ P_documentNavigableItemName_!fileDataType.stringRepresentation_stateDictionary_navigableItemRepresentation_navigableItemName[documentURL_documentExtensionIdentifierXkmTˆ‡€#lÖ‘’“ ”•–—˜™š ._DocumentLocation^IdentifierPath_WorkspaceRootFilePath_DomainIdentifier_IndexOfDocumentIdentifierdVgjU€‹_/Xcode.IDENavigableItemDomain.WorkspaceStructureÒ   S¦Ÿ ¡¢£¤WZ\_ab€)Ó§¨ ˆp«ZIdentifierUIndexX-Y_MealInteractor.swiftÒ \ ]®¯_IDEArchivableStringIndexPair¢° `_IDEArchivableStringIndexPairÓ§¨ ²¶«[€vYWUseCaseÓ§¨ ·¸«]^YVDomainÓ§¨ ¼¶«`€vYTCoreÓ§¨ W .«€‹YÓ§¨ Å .«c€‹Y[TheMealsAppÓ ¹  ·ÊË Wef€ _sfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Domain/UseCase/MealInteractor.swiftÒ \ ]ÏĞ_DVTDocumentLocation¢Ñ `_DVTDocumentLocationÒ ÓÔÕZpathStringih_M/Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp.xcodeprojÒ \ ]ØÙ[DVTFilePath£ÚÛ `[DVTFilePath_PackedPathEntryÒ \ ]İŞ_(IDENavigableItemArchivableRepresentation¢ß `_(IDENavigableItemArchivableRepresentation_public.swift-source_-Xcode.IDEKit.EditorDocument.PegasusSourceCodeÓ   ãî 8ªäåæçèéêëìínopqrstuvwªï 0œœóÙÚœ÷ 0x€w€x€xz©ª€x…€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ   S¡y€)Ò  	 S¤ï .ï .œ€‹œ€‹€)Ó    ¢{|¢}€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ    ¢Ê~€}¢	²¢€Ç€^documentLengthÓ   #' £$%&€‚£()Şƒ„€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ0 1é\NS.uuidbytesOé&‡ı©ÛD¨µ&Bu×æ€ˆÒ4 5é\NS.uuidbytesO>ä”™KüMğ²åÛíñ€³€ˆÓ   8; ¢õ:€†¢²	€Ç¢€^documentLength^MealInteractorÒ \ ]BC_IDEEditorHistoryItem¢D `_IDEEditorHistoryItemØ‚ƒ„ …†‡F‰HIŒK Nk™Šˆ³€lÖ‘’“ ”•OP˜™š .—‹gjU€‹Ò  V S¦WXYZ[\Œ’”•€)Ó§¨ F .«€‹Y_DetailRouter.swiftÓ§¨ d¶«€vYVRouterÓ§¨ i .«‘€‹YVDetailÓ§¨ n¸«“^YVModuleÓ§¨ W .«€‹YÓ§¨ w .«–€‹Y[TheMealsAppÓ ¹  ·|Ë W˜f€ _rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Detail/Router/DetailRouter.swiftÓ   Œ 8ª‚ƒ„…†‡ˆ‰Š‹š›œŸ ¡¢£ª 0œœ‘– .œ• 0¤€w€x€x¦€‹€x±€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  £ S¡¤¥€)Ò  § S¤‘‘¡¢¡¢€)Ó   ®± ¢¯°§¨¢²³©¯€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ¸¼ £¹º»ª«¬£½¾Ş­®€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒÅ Æé\NS.uuidbytesOa;¼Æ ²Hİ‚‘=ãŸœß€ˆÒÉ Êé\NS.uuidbytesOY”×ËpC†„ŞÇgXä9©€ˆÓ   ÍĞ ¢ÎÊ°€}¢¼²®€Ç€^documentLengthÓ   ÖÙ ¢õØ€²¢²¼€Ç®€^documentLength_makeMealView(for:game:)Ø‚ƒ„ …†‡à‰âãŒà O¸kÃµˆ¸€!lÖ‘’“ ”•éê˜™š .Á¶gjU€‹Ò  ğ S¦ñòóôõö·¹º½¾¿€)Ó§¨ à .«¸€‹Y_SearchRouter.swiftÓ§¨ d¶«€vYÓ§¨ «»¼YVSearchÓ§¨ n¸«“^YÓ§¨ W .«€‹YÓ§¨  .«À€‹Y[TheMealsAppÓ ¹  ·Ë WÂf€ _rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Search/Router/SearchRouter.swiftÓ   % 8ª !"#$ÄÅÆÇÈÉÊËÌÍª& 0œœ*– .œ. 0Î€w€x€xĞ€‹€xÛ€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  < S¡=Ï€)Ò  @ S¤Z¶Z¶;€v;€v€)Ó   GJ ¢HIÑÒ¢KLÓÙ€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   QU £RSTÔÕÖ£VWŞ×Ø€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ^ _é\NS.uuidbytesOQ´Ğ$nO““C7Œé«€ˆÒb cé\NS.uuidbytesOö='£%SAÛ»Ú<Ñçİ€ˆÓ   fi ¢gÊÚ€}¢	f²¿€Ç€^documentLengthÓ   or ¢õq€Ü¢²	f€Ç¿€^documentLengthØ‚ƒ„ …†‡x‰z{Œ} MákëŞˆ€lÖ‘’“ ”•‚˜™š .éßgjU€‹Ò  ˆ S¦‰Š‹Œàâäåæç€)Ó§¨ x .«á€‹Y_DetailPresenter.swiftÓ§¨ – .«ã€‹YYPresenterÓ§¨ i .«‘€‹YÓ§¨ n¸«“^YÓ§¨ W .«€‹YÓ§¨ § .«è€‹Y[TheMealsAppÓ ¹  ·¬Ë Wêf€ _xfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Detail/Presenter/DetailPresenter.swiftÓ   ±¼ 8ª²³´µ¶·¸¹º»ìíîïğñòóôõª½ 0œœÁYZœÅ 0ö€w€x€xø:;€x€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  Ó S¡Ô÷€)Ò  × S¤opop,-,-€)Ó   Şá ¢ßàùú¢âãûı€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   èë ¢Êê€}ü¢²†€Ç3€^documentLengthÓ   ñõ £òóôşÿ £ö÷Ş€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒş ÿé\NS.uuidbytesOQÙ°ÊT@U¾_8(ÌÙ`€ˆÒ é\NS.uuidbytesO¥Æ;÷@8—ü.íG>ò€ˆÓ   	 ¢õ€¢²†€Ç3€^documentLength_DetailPresenterØ‚ƒ„ …†‡‰Œ L
-kˆ-€lÖ‘’“ ”•˜™š .gjU€‹Ò    S¦!"#$%&	€)Ó§¨  .«
-€‹Y_SearchPresenter.swiftÓ§¨ – .«ã€‹YÓ§¨ «»¼YÓ§¨ n¸«“^YÓ§¨ W .«€‹YÓ§¨ > .«€‹Y[TheMealsAppÓ ¹  ·CË Wf€ _xfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Search/Presenter/SearchPresenter.swiftÓ   HS 8ªIJKLMNOPQRªT 0œœXœ\ 0€w€x€x €ª¡€x+€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  j S¡k€)Ò  n S¤ñòñò¾¿¾¿€)Ó   ux ¢vw!"¢yz#)€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ƒ £€‚$%&£„…Ş'(€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒŒ é\NS.uuidbytesO“ºKÿÎvJ8£æâ‘/½6€ˆÒ ‘é\NS.uuidbytesOwÙ0•"}F~™êf5ít€ˆÓ   ”— ¢Ê–€}*¢²€ÇË€^documentLengthÓ     ¢õŸ€,¢²€ÇË€^documentLength_linkBuilder(for:game:content:)Ø‚ƒ„ …†‡§¨©ªŒ¬ R®39;/ˆ@€':Ö‘’“ ”•°±˜™´µ81gj07_1Xcode.IDENavigableItem.WorkspaceGroupedLogsDomainÒ  ¸ S¢¹º25€)Ó§¨ §¾«34YWAnalyzeÓ§¨ Ã .«6€‹Y[TheMealsAppÿÿÿÿÿÿÿÓ ¹  · ŒË W€(f€ _$com.apple.dt.IDE.BuildLogContentType_'Xcode.IDEKit.EditorDocument.LogDocumentÓ   ÏÑ 8¡Ğ<¡Ò=€:_SelectedDocumentLocationsÒ  Ö S¡×>€)Õ  · ¸ ¹ º » W ½İ ë€9€ ?€?_2x-xcode-log://DE4259B5-7817-44E7-8091-BC59E4CDE608_Analyze target RealmSwiftØ‚ƒ„ …†‡â‰äåŒç QEkOBˆi€%lÖ‘’“ ”•ëì˜™š .MCgjU€‹Ò  ò S¦óôõö÷øDFGIJK€)Ó§¨ â .«E€‹Y_FavoriteRouter.swiftÓ§¨ d¶«€vYÓ§¨ ¶«H€vYXFavoriteÓ§¨ n¸«“^YÓ§¨ W .«€‹YÓ§¨  .«L€‹Y[TheMealsAppÓ ¹  ·Ë WNf€ _vfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Favorite/Router/FavoriteRouter.swiftÓ   & 8ª !"#$%PQRSTUVWXYª' 0œœ+– .œ/ 0Z€w€x€x\€‹€xg€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  = S¡>[€)Ò  A S¤&ñ&ñ€}€}€)Ó   HK ¢IJ]^¢LM_e€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   RV £STU`ab£WXŞcd€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ_ `é\NS.uuidbytesOmÚ3ßÒAB¹Ùså®öÇ€ˆÒc dé\NS.uuidbytesO-ØG«÷ğJ®[0r¡=İ€ˆÓ   gj ¢hÊf€}¢²‰€Ç€^documentLengthÓ   ps ¢õr€h¢²€Ç‰€^documentLength_makeMealView(for:game:)Ø‚ƒ„ …†‡z‰|}Œ Knkwkˆ‘€lÖ‘’“ ”•ƒ„˜™š .ulgjU€‹Ò  Š S¦‹Œmopqrs€)Ó§¨ z .«n€‹Y_FavoritePresenter.swiftÓ§¨ – .«ã€‹YÓ§¨ ¶«H€vYÓ§¨ n¸«“^YÓ§¨ W .«€‹YÓ§¨ ¨ .«t€‹Y[TheMealsAppÓ ¹  ·­Ë Wvf€ _|file:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Favorite/Presenter/FavoritePresenter.swiftÓ   ²½ 8ª³´µ¶·¸¹º»¼xyz{|}~€ª¾ 0œœÂŸ .œÆ 0‚€w€x€x„€Š€‹€x€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  Ô S¡Õƒ€)Ò  Ø S¤êëêë€×€Ø€×€Ø€)Ó   ßâ ¢àá…†¢ãä‡€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   éí £êëìˆ‰Š£îïŞ‹Œ€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒö ÷é\NS.uuidbytesO$‘çCû…îLğAñ`ë€ˆÒú ûé\NS.uuidbytesOİ;Øz"C0œ ·.5o€ˆÓ   ş ¢Ê €}¢²€Ç€ä€^documentLengthÓ   
- ¢õ	€¢²€Ç€ä€^documentLength_linkBuilder(for:game:content:)Ø‚ƒ„ …†‡‰Œ J–k “ˆº€lÖ‘’“ ”•˜™š .”gjU€‹Ò  ! S¦"#$%&'•—™š›œ€)Ó§¨  .«–€‹Y_FavoriteView.swiftÓ§¨ /¸«˜^YTViewÓ§¨ ¶«H€vYÓ§¨ n¸«“^YÓ§¨ W .«€‹YÓ§¨ @ .«€‹Y[TheMealsAppÓ ¹  ·EË WŸf€ _rfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Favorite/View/FavoriteView.swiftÓ   JU 8ªKLMNOPQRST¡¢£¤¥¦§¨©ªªV 0œœZ
-»œ^ 0«€w€x€x­€ª5€x¸€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  l S¡m¬€)Ò  p S¤‘X‘X¢Y¢Y€)Ó   wz ¢xy®¯¢{|°¶€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   … £‚ƒ„±²³£†‡Ş´µ€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ é\NS.uuidbytesOlZ»T+Ly£Dì]“ü9€ˆÒ’ “é\NS.uuidbytesOc%¾»IWµ[P­ {€ˆÓ   –™ ¢Ê˜€}·¢²
-ú€Ç4€^documentLengthÓ   Ÿ¢ ¢õ¡€¹¢²
-ú€Ç4€^documentLengthWcontentØ‚ƒ„ …†‡©‰«¬Œ® I¿kÈ¼ˆä€lÖ‘’“ ”•²³˜™š .Æ½gjU€‹Ò  ¹ S¥º»¼½¾¾ÀÂÃÄ€)Ó§¨ © .«¿€‹Y_Injection.swiftÓ§¨ Æ¶«Á€vYRDIÓ§¨ ¼¶«`€vYÓ§¨ W .«€‹YÓ§¨ Ó .«Å€‹Y[TheMealsAppÓ ¹  ·ØË WÇf€ _bfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/DI/Injection.swiftÓ   İè 8ªŞßàáâãäåæçÉÊËÌÍÎÏĞÑÒªé 0œœíŸ .œñ 0Ó€w€x€x×€Š€‹€xâ€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ÿ S¡ Ô€)Ò   S¤ÕÖÕÖ€)!PÓ    ¢ØÙ¢ÚÜ€_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ    ¢Ê€}Û¢²
-†€Ç€^documentLengthÓ   # £ !"İŞß£$%Şàá€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ, -é\NS.uuidbytesOn
-WIEDŸŸ^ôé4€ˆÒ0 1é\NS.uuidbytesO	rhûííK§³ÑËıIÊØ€ˆÓ   47 ¢õ6€ã¢²
-†€Ç€^documentLength_provideMeal(meal:game:)Ø‚ƒ„ …†‡>‰@AŒC ûékòæˆ€NlÖ‘’“ ”•GH˜™š .ğçgjU€‹Ò  N S¥OPQRSèêìíî€)Ó§¨ >¸«é^Y_MealRepository.swiftÓ§¨ [ .«ë€‹YTDataÓ§¨ ¼¶«`€vYÓ§¨ W .«€‹YÓ§¨ h .«ï€‹Y[TheMealsAppÓ ¹  ·mË Wñf€ _ifile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Core/Data/MealRepository.swiftÓ   r} 8ªstuvwxyz{|óôõö÷øùúûüª~ 0œœ‚WXœ† 0ı€w€x€xÿXY€x
-€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ” S¡•ş€)Ò  ˜ S¤mnmnJKJK€)Ó   Ÿ¢ ¢ ¡ ¢£¤€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ©­ £ª«¬£®¯Ş€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ¶ ·é\NS.uuidbytesOò ±ŠøIî“dl«À—¶€ˆÒº »é\NS.uuidbytesO"êøZiI…ˆ”q-l(×€ˆÓ   ¾Á ¢¿Ê	€}¢˜²W€Ç€^documentLengthÓ   ÇÊ ¢õÉ€¢²˜€ÇW€^documentLength_getGameDetail(by:)	Ò  Ò€¡Ó©ÒÖ ×Ø_currentEditorHistoryItem4Ø‚ƒ„ …†‡©‰ÜİŒ© I¿kˆ¿€lÖ‘’“ ”•ãä˜™š .gjU€‹Ò  ê S¥ëìíîï€)Ó§¨ © .«¿€‹YÓ§¨ Æ¶«Á€vYÓ§¨ ¼¶«`€vYÓ§¨ W .«€‹YÓ§¨  .«€‹Y[TheMealsAppÓ ¹  ·ØË WÇf€ Ó    8ª !"#$ª 0œœŸ .œ 0%€w€x€x'€Š€‹€x2€w€:_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  - S¡.&€)Ò  1 S¤nZnZK;K;€)Ó   8; ¢9:()¢<=*0€_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   BF £CDE+,-£GHŞ./€†€_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒO Pé\NS.uuidbytesOn
-WIEDŸŸ^ôé4€ˆÒS Té\NS.uuidbytesO	rhûííK§³ÑËıIÊØ€ˆÓ   WZ ¢ÊY€}1¢²
-†€Ç€^documentLengthÓ   `c ¢õb€3¢²
-†€Ç€^documentLengthÒ \ ]ij_IDEEditorHistoryStack¢k `_IDEEditorHistoryStack_ItemKind_EditorÖ‘’“ ”•no˜™š .>7gjU€‹Ò  u S¥vwxyz89:;<€)Ó§¨ © .«¿€‹YÓ§¨ Æ¶«Á€vYÓ§¨ ¼¶«`€vYÓ§¨ W .«€‹YÓ§¨  .«=€‹Y[TheMealsAppÓ ¹  ·ØË WÇf€ Ó   –› 8¤—˜™š@ABC¤œ¶ŸDI€vQ€:XLeftView_IDESplitViewDebugAreaZLayoutModeYRightViewÓ   ¦« 8¤§¨©ªEFGH¤œ .² 0€x€‹€Ç€w€:_VariablesViewShowsRawValues_VariablesViewSelectedScope_ VariablesViewViewSortDescriptors_VariablesViewShowsTypeÓ   ¶¸ 8¡·J¡¹K€:_DVTSplitViewItemsÒ  ½€¢¾¿LO©Ó   ÂÆ £456>?@£Ç 0ÉM€wN€XLeftView#@…ø     Ó   ÎÒ £456>?@£Ó 0ÉP€wN€YRightViewÓ   Ùâ 8¨ÚÛÜİŞßàáRSTUVWXY¨œœœ 0œœœœ€x€x€x€w€x€x€x€x€:_+IDEStructuredConsoleAreaLibraryEnabledState_-IDEStructuredConsoleAreaTimestampEnabledState_*IDEStructuredConsoleAreaPIDTIDEnabledState_,IDEStructuredConsoleAreaMetadataEnabledState_(IDEStructuredConsoleAreaTypeEnabledState_-IDEStructuredConsoleAreaSubsystemEnabledState_/IDEStructuredConsoleAreaProcessNameEnabledState_,IDEStructuredConsoleAreaCategoryEnabledState_Layout_LeftToRightÓ Áö »ò Å_NSIndexPathValue€8Ó   ùú 8  €:   " , 1 : ? Q V \ ^"/7BINPRWY\^uœ©ÆÈÊÌÎĞÒÔÖØÚÜŞàâÿ	"$&A^k‹²ÄÚ÷"<N˜¡¶¸º¼¾ÀÂÄÆÈÊÌÙáíïñóXalu{€‰–˜šœ "$£°²´¶1>@BD¿ÌÎĞÒGTVXZÏÜŞàâXegikäñóõ÷,5=BOVXZ\cegjl–Æ !.024ivy{~€‚§ª¬®ÃÍàìöøúûıÿ 2468AILNWels|ˆ™¢»ÂÛñú$1469;=Ybegi~€‚ƒ…‡”–˜¡¤¦³îğòôöøúüş 
- "$&acegiknqtwz}€ƒ†‰Œ’•˜›¡¤§ª­°²¿ÁÃÅ;HJLN¾ËÍÏÑKXZ\^Øåçéë`moqsâïñóõanprtéöøúüw„†ˆŠş‡”–˜š  # % ' ) £ ° ² ´ ¶!,!9!;!=!?!·!Ä!Æ!È!Ê"="J"L"N"P"Å"Ò"Ô"Ö"Ø#P#]#_#a#c#Ó#à#õ#÷#ù#û#ı#ÿ$$$$$	$$ $"$$$&$($*$,$.$0$2$4$Q$p$”$¶$Ú% %$%C%b%%ˆ%‹%%%˜%¡%£%¥%§%©%«%­%¯%°%±%¾%Ã%Å%Ç%Ì%Î%Ğ%Ò%ï&&&$&&&(&-&/&1&3&?&N&W&X&Z&]&f&k&x&&&ƒ&…&Œ&&&’&”&µ&ç'''"'/'B'D'M'T'Y'b'o'‚'„'''œ'¡'£'¥'ª'¬'®'°'¶'Å'Ò'ç'é'ë'í'ï'ñ'ó'õ'÷'ù'û((((((((( ("($(&(C(b(†(¨(Ì(ò))5)T)q)z)})))Š)“)•)—)™)›))Ÿ)¡)®)³)µ)·)¼)¾)À)Â)ß********!*#*2*5*B*I*K*M*O*V*X*Z*\*^**±*Ú*ã*ğ+++++.+0+9+;+H+M+O+Q+V+X+Z+\+k+x+++‘+“+•+—+™+›++Ÿ+¡+¶+¸+º+¼+¾+À+Â+Ä+Æ+È+Ê+Ì+é,,,,N,r,˜,¼,Û,ú-- -#-%-'-0-9-;-=-?-A-C-P-U-W-Y-^-`-b-d-‡-¤-±-¸-º-¼-¾-Å-Ç-É-Ë-Í-ö.(.I.R._.r.t.}.Š..Ÿ.¬.±.³.µ.º.¼.¾.À.Ï.Ò.Û.Ü.Ş.ë.ğ.ò.ô.ù.û.ı.ÿ///0/2/4/6/8/:/</>/@/B/D/Y/[/]/_/a/c/e/g/i/k/m/o/Œ/«/Ï/ñ00;0_0~00º0Ã0Æ0È0Ê0Ó0Ü0Ş0à0â0ä0æ0è0ê0÷0ü0ş1 111	11.1K1X1_1a1c1e1l1n1p1r1t1•1¾1ğ1ù2222$212D2F2S2X2Z2\2a2c2e2g2v2y2†2‹222”2–2˜2š2©2¶2Ë2Í2Ï2Ñ2Ó2Õ2×2Ù2Û2İ2ß2ô2ö2ø2ú2ü2ş3 3333	33(3G3k33±3×3û4494V4_4b4d4f4o4x4z4|4~4€4‚4„4†4“4˜4š4œ4¡4£4¥4§4Ê4ç4ô4û4ı4ÿ555
-555515Z5Œ5•5¢5µ5·5À5Í5à5â5ï5ô5÷5ù5ş666666$6)6+6.6365686:6I6V6k6n6q6t6w6z6}6€6ƒ6†6‰66¡6£6¥6§6ª6­6¯6±6´6¶6¸6Õ6ô77:7^7„7¨7Ç7æ8888888&8(8*8,8.808=8B8E8H8M8P8S8U8x8•8¢8©8¬8¯8²8¹8¼8¾8Á8Ã8ì99?9H9U9h9j9s9€9“9•9¢9§9ª9¬9±9´9¶9¸9Ç9Ê9Ó9à9å9ç9ê9ï9ñ9ô9ö:::':*:-:0:3:6:9:<:?:B:E:Z:]:_:a:c:f:i:k:m:p:r:t:‘:°:Ô:ö;;@;d;ƒ;¢;¿;È;Ë;Î;Ğ;Ù;â;å;è;ë;î;ğ;ò;ô<<<	<<<<<<6<Y<f<k<m<p<u<w<z<|<‹<<›<¢<¥<¨<«<²<µ<¸<º<¼<å==8=A=N=a=c=l=y=Œ==›= =¢=¥=ª=¬=¯=±=À=Í=â=å=è=ë=î=ñ=ô=÷=ú=ı> >>>>>>!>$>'>)>,>.>0>M>l>>²>Ö>ü? ???^?{?„?‡?Š?Œ?•??¡?¤?§?ª?¬?®?°?½?Â?Å?È?Í?Ğ?Ó?Õ?ø@@"@)@,@/@2@9@<@?@A@C@l@@¿@È@Õ@è@ê@óA AAA"A'A*A,A1A4A6A8AGAJASAUAbAgAiAlAqAsAvAxA‡A”A©A¬A¯A²AµA¸A»A¾AÁAÄAÇAÜAßAáAãAåAèAêAìAîAñAóAõBB1BUBwB›BÁBåCC#C@CICLCOCQCZCcCfChCkCmCoCqC~CƒC†C‰CC‘C”C–C¹CÖCãCêCíCğCóCúCüCÿDDD%DND€D‰D–D©D«D´DÁDÔDÖDãDèDëDíDòDõD÷DùEEEEEE"E'E)E,E.E=EJE_EbEeEhEkEnEqEtEwEzE}E’E•E—E™E›EE¡E£E¥E¨EªE¬EÉEèFF.FRFxFœF»FÚF÷G GGGGGGG G#G&G(G*G7G<G?GBGGGJGMGOGrGGœG£G¦G©G¬G³G¶G¸G»G½GæHH9HBHOHbHdHmHzHHHœH¡H£H¦H«H­H°H²HÁHÄHÑHÖHØHÛHàHâHåHçHöIIIII!I$I'I*I-I0I3I6IKINIPIRITIWIZI\I^IaIcIeI‚I¡IÅIçJJ1JUJtJ“J°J¹J¼J¿JÁJÊJÓJÖJÙJÜJßJáJãJåJòJ÷JúJıKKKK
-K-KJKWK^KaKdKgKnKqKsKvKxKªKËKôKıL
-LLL(L5LHLJLWL\L^LaLfLhLkLmL|LLŒL‘L“L–L›LL L¢L±L¾LÓLÖLÙLÜLßLâLåLèLëLîLñMM	MMMMMMMMMM M=M\M€M¢MÆMìNN/NNNkNtNwNzN|N…NN‘N”N—NšNœNN N­N²NµN¸N½NÀNÃNÅNèOOOOOO"O)O+O.O1O3OTO†O¯O¸OÅOØOÚOãOğPPPPPPP!P$P&P(P7P:PGPLPNPQPVPXP[P]PlPyPP‘P”P—PšPP P£P¦P©P¬PÁPÄPÆPÈPÊPÍPĞPÒPÔP×PÙPÛPøQQ;Q]QQ§QËQêR	R&R/R2R5R7R@RIRKRMRORQRSR`ReRhRkRpRsRvRxR›R¸RÅRÌRÏRÒRÕRÜRßRâRäRæSSASbSkSxS‹SS–S£S¶S¸SÅSÊSÍSÏSÔSÖSØSÚSéSöSûSıT TTT	TTT'T<T?TBTETHTKTNTQTTTWTZToTrTtTvTxT{T}TTT„T†TˆT¥TÄTèU
-U.UTUxU—U¶UÓUÜUßUâUäUíUöUøUúUüUşV VVVVVV V#V%VHVeVrVyV|VV‚V‰V‹VV‘V“V´VİWWW%W8W:WCWPWcWeWrWwWyW|WWƒW†WˆW—WšW§W¬W®W±W¶W¸W»W½WÌWÙWîWñWôW÷WúWıX XXX	XX!X$X&X(X*X-X0X2X4X7X9X;XXXwX›X½XáYY+YJYiY†YY’Y•Y—Y Y©Y«Y®Y°Y³YµY·YÄYÉYÌYÏYÔY×YÚYÜYùZZ)Z.Z1Z3Z8Z;Z=Z?ZNZQZ^ZeZhZkZnZuZwZzZ}ZZ ZÉZû[[[$[&[/[<[O[Q[^[c[e[h[m[o[r[t[ƒ[[¥[¨[«[®[±[´[·[º[½[À[Ã[Ø[Û[İ[ß[á[ä[ç[ê[ì[ï[ñ[ó\\/\S\u\™\¿\ã]]!]>]G]J]M]O]X]a]d]g]j]m]o]q]s]€]…]ˆ]‹]]“]–]˜]µ]Ø]å]ê]ì]ï]ô]ö]ù]û^
-^^^!^$^'^*^1^4^7^9^;^d^–^·^À^Í^à^â^ë^ø_____%_*_,_/_4_6_9_;_J_W_l_o_r_u_x_{_~__„_‡_Š_Ÿ_¢_¤_¦_¨_«_®_°_²_µ_·_¹_Ö_õ``;`_`…`©`È`çaaaaaaa'a)a+a-a/a1a>aCaFaIaNaQaTaVasa–a£a¨a«a­a²aµa·a¹aÈaËaØaßaâaåaèaïaòaõa÷aùb"bTbub~b‹bb b©b¶bÉbËbØbİbßbâbçbébìbîbıc
-cc"c%c(c+c.c1c4c7c:c=cRcUcWcYc[c^c`cbcdcgcickcˆc§cËcídd7d[dzd™d¶d¿dÂdÅdÇdĞdÙdÛdİdßdádãdğdõdødûe eeee%eHeUeZe\e_edefeiekeze}eŠe‘e”e—eše¡e¤e§e©e«eÔff'f0f=fPfRf[fhf{f}fŠff‘f”f™f›ff f¯f¼fÑfÔf×fÚfİfàfãfæféfìfïggg	gggggggggg:gYg}gŸgÃgéhh,hKhhhqhthwhyh‚h‹hhh“h•h—h¤h©h¬h¯h´h·hºh¼hÙhüi	iiiiiiii.i1i>iEiHiKiNiUiWiZi]i_i€i²iÛiäiñjjjjj/j1j>jCjEjHjMjOjRjTjcjpj…jˆj‹jj‘j”j—jšjj j£j¸j»j½j¿jÁjÄjÇjÊjÌjÏjÑjÓjğkk3kUkykŸkÃkâlll'l*l-l/l8lAlDlFlIlKlMlOl\laldlglllolrltl‘l´lÁlÆlÈlËlĞlÒlÕl×lælélölım mmmmmmmm@mam“mœm©m¼m¾mÇmÔmçmémòmônnnnnnnnn&n3nHnKnNnQnTnWnZn]n`ncnfn{n~n€n‚n„n‡nŠnŒnn‘n“n•n²nÑnõoo;oao…o¤oÃoàoéoìoïoñoúpppppppp!p$p'p,p/p2p4pQptpp†pˆp‹pp’p•p—p¦p©p¶p½pÀpÃpÆpÍpÏpÒpÕp×pøq!qSq\qiq|q~q‡q”q§q©q¶q»q½qÀqÅqÇqÊqÌqÛqèqır rrr	rrrrrrr0r3r5r7r9r<r?rArCrFrHrJrgr†rªrÌrğss:sYsxs•ss¡s¤s¦s¯s¸sºs¼s¾sÀsÂsÏsÔs×sÚsßsâsåsçtt't4t9t;t>tCtEtHtJtYt\titptstvtyt€tƒt…tˆtŠt¼tİuuuu/u1u:uGuZu\uiunupusuxuzu}uuu›u°u³u¶u¹u¼u¿uÂuÅuÈuËuÎuãuæuèuêuìuïuòuõu÷uúuüuşvv:v^v€v¤vÊvîww,wIwRwUwXwZwcwlwowqwtwvwxwzw‡wŒww’w—wšwwŸw¼wßwìwñwôwöwûwşx xxxx!x(x+x.x1x8x;x=x@xBxtx•x¾xÇxÔxçxéxòxÿyyyyy,y1y3y6y;y=y@yByQy^ysyvyyy|yy‚y…yˆy‹yy‘y¦y©y«y­y¯y²y´y¶y¸y»y½y¿yÜyûzzAzez‹z¯zÎzí{
-{{{{{${-{0{3{6{9{;{H{M{P{S{X{[{^{`{}{ {­{²{´{·{¼{¾{Á{Ã{Ò{Õ{â{é{ì{ï{ò{ù{ü{ÿ|||,|^||ˆ|•|¨|ª|³|À|Ó|Õ|â|ç|é|ì|ñ|ó|ö|ø}}})},}/}2}5}8};}>}A}D}G}\}_}a}c}e}h}j}m}o}r}t}v}“}²}Ö}ø~~B~f~…~¤~Á~Ê~Í~Ğ~Ò~Û~ä~ç~ê~í~ğ~ò~ÿ
-:Wdknqt{~ƒ…·à€€
-€€*€,€5€B€U€W€d€i€k€n€s€u€x€z€‰€Œ€€›€ €¢€¥€ª€¬€¯€±€À€Í€â€å€è€ë€î€ñ€ô€÷€ú€ı !#%'*,.Kj°Ôú‚‚=‚\‚y‚‚‚…‚ˆ‚Š‚“‚œ‚Ÿ‚¢‚¥‚¨‚ª‚¬‚¹‚¾‚Á‚Ä‚É‚Ì‚Ï‚Ñ‚ôƒƒƒ%ƒ(ƒ+ƒ.ƒ5ƒ7ƒ:ƒ=ƒ?ƒ`ƒ‰ƒ»ƒÄƒÑƒäƒæƒïƒü„„„„#„&„(„-„0„2„4„C„F„S„X„Z„]„b„d„g„i„x„…„š„„ „£„¦„©„¬„¯„²„µ„¸„Í„Ğ„Ò„Ô„Ö„Ù„Ü„ß„á„ä„æ„è……$…H…j……´…Ø…÷††3†<†?†B†D†M†V†X†Z†\†^†`†m†r†u†x†}†€†ƒ†…†¨†Å†Ò†Ù†Ü†ß†â†é†ì†ï†ñ†ó‡‡N‡o‡x‡…‡˜‡š‡£‡°‡Ã‡Å‡Ò‡×‡Ú‡Ü‡á‡ä‡æ‡è‡÷‡ú‡üˆ	ˆˆˆˆˆˆˆˆ.ˆ;ˆPˆSˆVˆYˆ\ˆ_ˆbˆeˆhˆkˆnˆƒˆ†ˆˆˆŠˆŒˆˆ’ˆ”ˆ–ˆ™ˆ›ˆˆºˆÙˆı‰‰C‰i‰‰¬‰Ë‰è‰ñ‰ô‰÷‰ùŠŠŠŠŠŠŠŠŠ&Š+Š.Š1Š6Š9Š<Š>ŠaŠ~Š‹Š’Š•Š˜Š›Š¢Š¥Š§ŠªŠ¬ŠÕŠö‹(‹1‹>‹Q‹S‹\‹i‹|‹~‹‹‹‹“‹•‹š‹‹Ÿ‹¡‹°‹³‹À‹Å‹Ç‹Ê‹Ï‹Ñ‹Ô‹Ö‹å‹ò‹õ‹ø‹û‹şŒ ŒŒŒŒŒkŒxŒŒ„Œ‡ŒŠŒŒ–Œ™ŒœŒŸŒ¢Œ¤ŒÔ2[uŠ“–™›¬¶¹¼¿Â"/47:?BEGNUjvŸ¦ÆÜéêëíúı "'*3:?HKMO\_adgiruwzƒ’™¦­°³¶½ÀÃÆÈé!JWZ]`ceqz‚‹—£°³¶¹¼¾ÊÓİà‘‘'‘9‘@‘I‘V‘Y‘\‘_‘b‘d‘¢‘«‘´‘·‘Ä‘Ù‘Ü‘ß‘â‘å‘è‘ë‘î‘ñ‘ô‘÷’’’’’’’’’!’$’'’)’4’K’d’}’’§’¼’Æ’Û’ó“““X“_“u“|“‡““‘“”“¡“ª“­“°“³“¶“¿“Â“Å“È“Ë“Í“æ”””O”U”^”`”i”p”s”v”y”|”‰””“”–”™” ”£”¦”©”«”Ô••.•0•=•D•G•J•M•T•W•Z•]•_•h•o•x™„™†™“™ ™£™¦™©™¬™¯™²™¿™Â™Ä™Ç™Ê™Ì™Î™Ğ™õššDšnšwš€š‰šŒš¯š¼šÍšĞšÓšÖšÙšÜšßšâšåšöšøšûšıšÿ››››	››#›2›b›}›¦›È›äœ%œGœTœcœfœiœlœoœrœuœxœ‡œ‰œŒœœ’œ•œ—œšœœœ¯œÂœÖœéœı+69<?BEPSVY\_a„©½Ïõ #&),.EYrš›œ¹ÆÉÌÏÒÔïøŸŸŸ¢ø££*£1£Z£¿£Ì£Õ£Ø£Û£Ş£á£ê£í£ğ£ó£ö£ø¤¤#¤<¤W¤d¤e¤f¤h¤ƒ¤¤“¤–¤™¤œ¤¤¹¤Â¤ß¤â¤å¥š¥À¥Í¥Ô¥×¥Ú¥İ¥ä¥ç¥ê¥í¥ï¦¦<¦_¦‚¦¦˜¦›¦¦¡¦¤¦­¦°¦³¦¶¦¹¦»¦Ò¦æ¦ÿ§§5§B§E§H§K§N§P§k§t§‘§”§—¨ú©©©©©© ©"©%©'©Q©u©~©©‚©‹©˜©¯©²©µ©¸©»©¾©Á©Ä©Ç©Ê©Í©Ğ©ç©ê©ì©ï©ò©õ©ø©û©şªªªª	ªªEªWªbªvªª´ªÊªí««3«5«@«B«O«R«U«X«[«]«q«z««‚«…«ˆ«•«œ«Ÿ«¢«¥«¬«¯«±«´«¶«Ä«Ñ«ä«î«÷¬¬¬¬¬¬¬¬ ¬#¬%¬7¬@¬I¬L¬O¬R¬_¬l¬o¬r¬u¬x¬{¬~¬‹¬¬‘¬”¬—¬š¬œ¬¬©¬½¬Ó¬á¬í­­­­!­$­'­,­/­2­4­I­\­e­|­­‚­…­ˆ­‹­­‘­”­—­š­­Ÿ­À­Ü® ®®0®D®P®n®q®t®w®z®}®€®‚®…®®±®À®Ø®ë¯¯
-¯¯¯¯¯¯J¯S¯`¯c¯f¯i¯l¯o¯r¯t¯¯Œ¯’¯•¯˜¯›¯²¯»¯Ú¯ß¯ş°°°°°°(°+°.°1°8°E°H°J°M°R°_°b°d°g°t°w°y°|°ˆ°•°˜°›°±±±2±7±M±V±a±d±g±·±À±Ì±Ó±ß±ñ±ú²%²*²U²k²›²¨²½²À²Ã²Æ²É²Ì²Ï²Ò²Õ²Ø²Û²ğ²ó²õ²÷²ù²ü²ÿ³³³³	³³(³G³k³³±³×³û´´9´V´_´b´e´g´p´y´|´~´´ƒ´…´’´—´š´´¢´¥´¨´ª´Ç´ê´÷´ü´ÿµµµ	µµµµ)µ0µ3µ6µ9µ@µCµFµHµJµsµ¥µÆµÏµÜµïµñµú¶¶¶¶)¶.¶0¶3¶8¶:¶=¶?¶N¶]¶f¶}¶‚¶™¶º¶½¶À¶Ã¶Æ¶É¶Ì¶Î¶Ñ¶ê¶í¶ğ¶ó¶ö¶ù¶û······· ·#·%·2·5·7·:·O·\·_·a·d·k·x·{·}·€·‡·”·—·š··¤·±·´·¶·¹·Æ·É·Ë·Î·Ú·ç·ê·í·ï¸d¸q¸†¸‰¸Œ¸¸’¸•¸˜¸›¸¸¡¸¤¸¹¸¼¸¾¸À¸Â¸Å¸È¸Ê¸Ì¸Ï¸Ñ¸Ó¸ğ¹¹3¹U¹y¹Ÿ¹Ã¹âººº'º*º-º/º8ºAºDºGºJºMºOº\ºaºdºgºlºoºrºtº—º´ºÁºÈºËºÎºÑºØºÛºŞºàºâ»»=»^»g»t»‡»‰»’»Ÿ»²»´»Á»Æ»É»Ë»Ğ»Ó»Õ»×»æ»ó»ø»ú»ı¼¼¼¼	¼¼2¼S¼V¼Y¼\¼_¼b¼e¼g¼j¼ƒ¼†¼‰¼Œ¼¼’¼”¼¼ª¼­¼°¼³¼¶¼¹¼¼¼¾¼Ë¼Î¼Ğ¼Ó¼è¼õ¼ø¼ú¼ı½
-½½½½½½)½,½/½2½?½B½D½G½T½W½Y½\½h½u½x½{½}½ò½ÿ¾¾¾¾¾ ¾#¾&¾)¾,¾/¾2¾G¾J¾L¾N¾P¾S¾V¾X¾Z¾]¾_¾a¾~¾¾Á¾ã¿¿-¿Q¿p¿¿¬¿µ¿¸¿»¿½¿Æ¿Ï¿Ò¿Ô¿×¿Ù¿Û¿è¿í¿ğ¿ó¿ø¿û¿şÀ À#À@ÀMÀTÀWÀZÀ]ÀdÀgÀjÀlÀnÀ—ÀÉÀêÀóÁ ÁÁÁÁ+Á>Á@ÁMÁRÁUÁWÁ\Á_ÁaÁcÁrÁÁ„Á†Á‰ÁÁÁ“Á•Á¤ÁÅÁÈÁËÁÎÁÑÁÔÁ×ÁÙÁÜÁõÁøÁûÁşÂÂÂÂÂÂÂ"Â%Â(Â+Â.Â0Â=Â@ÂBÂEÂ]ÂjÂmÂoÂrÂ|Â‰ÂŒÂÂ‘ÂÂ¡Â¤Â§Â´Â·Â¹Â¼ÂÉÂÌÂÎÂÑÂİÂêÂíÂğÂòÃmÃzÃÃ’Ã•Ã˜Ã›ÃÃ¡Ã¤Ã§ÃªÃ­ÃÂÃÅÃÇÃÉÃËÃÎÃÑÃÔÃÖÃÙÃÛÃİÃúÄÄ=Ä_ÄƒÄ©ÄÍÄìÅÅ(Å1Å4Å7Å9ÅBÅKÅNÅQÅTÅWÅYÅfÅkÅnÅqÅvÅyÅ|Å~Å›Å¾ÅËÅĞÅÒÅÕÅÚÅÜÅßÅáÅğÅıÆÆÆ
-ÆÆÆÆÆÆÆGÆyÆšÆ£Æ°ÆÃÆÅÆÎÆÛÆîÆğÆıÇÇÇÇÇÇÇÇ"Ç4ÇUÇXÇ[Ç^ÇaÇdÇgÇiÇlÇ…ÇˆÇ‹ÇÇ‘Ç”Ç–ÇŸÇ¬Ç¯Ç²ÇµÇ¸Ç»Ç¾ÇÀÇÍÇĞÇÒÇÕÇíÇúÇıÇÿÈÈÈÈÈÈ%È(È+È.È;È>È@ÈCÈPÈSÈUÈXÈdÈqÈtÈwÈyÈôÉÉÉÉÉÉ"É%É(É+É.É1É4ÉIÉLÉNÉPÉRÉUÉWÉZÉ\É_ÉaÉcÉ€ÉŸÉÃÉåÊ	Ê/ÊSÊrÊ‘Ê®Ê·ÊºÊ½Ê¿ÊÈÊÑÊÔÊ×ÊÚÊİÊßÊìÊñÊôÊ÷ÊüÊÿËËË'ËDËQËXË[Ë^ËaËhËkËnËpËrË›ËÍËîË÷ÌÌÌÌ"Ì/ÌBÌDÌQÌVÌXÌ[Ì`ÌbÌeÌgÌvÌƒÌˆÌŠÌÌ’Ì”Ì—Ì™Ì¨ÌÉÌêÌíÌğÌóÌöÌùÌüÌşÍÍÍÍ Í#Í&Í)Í,Í`ÍiÍnÍqÍtÍvÍƒÍ†Í‰ÍŒÍ”Í–Í£Í¦Í¨Í«Í·ÍÀÍÍÍÏÍÒÍÔÍûÎ%Î2Î5Î8Î;Î>Î@Î\ÎeÎhÎkÎmÎ‚Î„Î†Î‡ÎŠÎŒÎÁÎİÎşÏÏÏÏ
-ÏÏÏÏÏ.Ï1Ï4Ï7Ï:Ï=Ï?ÏHÏUÏXÏ[Ï^ÏaÏdÏgÏiÏvÏyÏ{Ï~Ï•Ï¢Ï¥Ï§ÏªÏ·ÏºÏ¼Ï¿ÏÈÏÕÏØÏÛÏŞÏëÏîÏğÏóĞ ĞĞĞĞĞ!Ğ$Ğ'Ğ)Ğ¢Ğ¯ĞÄĞÇĞÊĞÍĞĞĞÓĞÖĞÙĞÜĞßĞâĞ÷ĞúĞüĞşÑ ÑÑÑÑ
-ÑÑÑÑ.ÑMÑqÑ“Ñ·ÑİÒÒ Ò?Ò\ÒeÒhÒkÒmÒvÒÒÒ„Ò†Ò‰Ò‹Ò˜ÒÒ Ò£Ò¨Ò«Ò®Ò°ÒÓÒğÒıÓÓÓ
-ÓÓÓÓÓÓÓGÓyÓšÓ£Ó°ÓÃÓÅÓÎÓÛÓîÓğÓıÔÔÔÔÔÔÔÔ"Ô/Ô4Ô6Ô9Ô>Ô@ÔCÔEÔTÔnÔÔ’Ô•Ô˜Ô›ÔÔ¡Ô£Ô¦Ô¿ÔÂÔÅÔÈÔËÔÎÔĞÔÙÔæÔéÔìÔïÔòÔõÔøÔúÕÕ
-ÕÕÕ)Õ6Õ9Õ;Õ>ÕKÕNÕPÕSÕ`ÕcÕfÕiÕvÕyÕ{Õ~Õ‹ÕÕÕ“ÕŸÕ¬Õ¯Õ²Õ´Ö3Ö@ÖUÖXÖ[Ö^ÖaÖdÖgÖjÖmÖpÖsÖˆÖ‹ÖÖÖ‘Ö”Ö–Ö˜ÖšÖÖŸÖ¡Ö¾Öİ××#×G×m×‘×°×Ï×ì×õ×ø×û×ıØØØØØØØØ&Ø+Ø.Ø1Ø6Ø9Ø<Ø>ØaØ~Ø‹Ø’Ø•Ø˜Ø›Ø¢Ø¥Ø¨ØªØ¬ØÕÙÙ(Ù1Ù>ÙQÙSÙ\ÙiÙ|Ù~Ù‹ÙÙ’Ù•ÙšÙœÙÙ Ù¯Ù¼ÙÁÙÃÙÆÙËÙÍÙÏÙÑÙàÚÚ"Ú%Ú(Ú+Ú.Ú1Ú4Ú6Ú9ÚRÚUÚXÚ[Ú^ÚaÚcÚlÚyÚ|ÚÚ‚Ú…ÚˆÚ‹ÚÚšÚÚŸÚ¢Ú·ÚÄÚÇÚÊÚÍÚÒÚßÚâÚäÚçÚôÚ÷ÚúÚıÛ
-ÛÛÛÛÛ"Û$Û'Û3Û@ÛCÛFÛHÛ½ÛÊÛßÛâÛåÛèÛëÛîÛñÛôÛ÷ÛúÛıÜÜÜÜÜÜÜ Ü#Ü%Ü(Ü*Ü,ÜIÜhÜŒÜ®ÜÒÜøİİ;İZİwİ€İƒİ†İˆİ‘İšİİ İ£İ¦İ¨İµİºİ½İÀİÅİÈİËİÍİğŞŞŞ!Ş$Ş'Ş*Ş1Ş4Ş7Ş9Ş;ŞdŞ–Ş·ŞÀŞÍŞàŞâŞëŞøßßßßß!ß$ß)ß+ß.ß0ß?ßLßQßSßVß[ß]ß`ßbßqßyßšßß ß£ß¦ß©ß¬ß®ß±ßÊßÍßĞßÓßÖßÙßÛßäßïßòßõßøßûßşà ààààà'à4à7à9à<à?àLàOàQàTàaàdàfàiàvàyà{à~àŠà—àšààŸááá&á)á,á/á2á5á8á;á>áAáDáYá\á^á`ábáeágáiákánápáráá®áÒáôââ>âbââ â½âÆâÉâÌâÎâ×âàâãâæâéâìâîâğâòâÿããã
-ããããã4ãWãdãiãkãnãsãuãxãzã‰ã–ãã ã£ã¦ã­ã°ã³ãµã·ãàää3ä<äIä\ä^ägätä‡ä‰ä–ä›ää ä¥ä§äªä¬ä»äÕäöäùäüäÿåååå
-åå&å)å,å/å2å5å7å@åKåNåQåTåWåZå\åiålåoårå‰å–å™å›åå£å°å³åµå¸åÅåÈåÊåÍåÚåİåßåâåîåûåşæææoæ|æ‘æ”æ—æšææ æ£æ¦æ©æ¬æ¯æÄæÇæÉæËæÍæĞæÓæÖæØæÛæİæßæüçç?çaç…ç«çÏçîèè*è3è6è9è;èDèMèPèSèVèYè[èhèmèpèsèxè{è~è€è£èÀèÍèÔè×èÚèİèäèçèêèìèîééIéjésé€é“é•éé«é¾éÀéÍéÒéÕé×éÜéßéáéãéòéÿêêê	êêêêê$ê9ê;êDêGêJêMêVêqêtêwê˜ê›êê¡ê¤ê§êªê¬ê¯êÈêËêÎêÑêÔê×êÙêâêíêğêóêöêùêüêşëëëëë ë#ë%ë(ë5ë8ë:ë=ëJëMëOëRë_ëbëdëgësë€ëƒë†ëˆë•ëªë­ë°ë³ë¶ë¹ë¼ë¿ëÂëÅëÈëİëàëâëäëæëéëëëíëïëòëôëöìì2ìVìxìœìÂìæíí$íAíJíMíPíRí[ídígíjímípíríí„í‡íŠíí’í•í—íºí×íäíëíîíñíôíûíşîîîî.î`îîŠî—îªî¬îµîÂîÕî×îäîéîëîîîóîõîøîúï	ïïïï ï%ï'ï*ï,ï;ïDï\ïaïyï‹ï¤ï§ïªï­ï°ï³ïµï¾ïÉïÌïÏïÒïÕïØïÚïçïêïìïïïüïÿğğğğğğğ&ğ)ğ+ğ.ğ;ğ>ğ@ğCğOğ\ğ_ğbğdğqğzğ}ğ€ğƒğ†ğğ’ğ•ğ—ğšğœğ¥ğ½ğÈğÒğßğèğëğîğñğôğığÿñññññ%ñBñeñ~ñ‹ññ‘ñ”ñ—ñ™ñ­ñ¶ñ»ñ¾ñÁñÄñÑñØñÛñŞñáñèñëñíñğñòñûòòòòòò!ò(ò+ò-ò0ò2ò<òIòZò]ò`òcòfòiòlòoòròƒò…ò‡ò‰ò‹òòò‘ò“ò•òÃòóó óOózóªóÜôô ô-ô@ôBôOôPôQ            ü              ôS
+á23456789:;ª
+ã 0ÂÂ
+ç7 .Â
+ë 0<€†€‡€‡>€·€…€‡J€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  
+ù S¡
+ú=€)Ò  
+ı S¤ . . . .€…€…€…€…€)Ó    ¢?@¢	AD€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ    ¢B€•¢ÙC€Õ€“^documentLengthmÓ    £EFG£õH€’I€“_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒ% &ı\NS.uuidbytesO¥10IµÊM¯¾ØğG’¬»€Ò) *ı\NS.uuidbytesOcCŒCNÚœÖ'ˆï”€Ó   -0 ¢/€›K¢Ù€ÕC€“^documentLengthÓ   6A 8ª789:;<=>?@MNOPQRSTUVªB 0ÂÂFGÚÂJ 0W€†€‡€‡Zf€‡g€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  X S¡YX€)Ò  \ S¤]v]vYY€)2Ó   dg ¢ef[\¢hi]c€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   nr £opq^_`£sõua€’b€“_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒ{ |ı\NS.uuidbytesOjö¦MMÇ®ùCè@\W€Ò €ı\NS.uuidbytesOah”ÍbBù®Ê X·:°c€Ó   ƒ† ¢„d€•¢‡Ùe€Õ€“^documentLength	#@      Ó   ‘ ¢€›h¢Ù‡€Õe€“^documentLengthÓ   —¢ 8ª˜™š›œŸ ¡jklmnopqrsª£ 0ÂÂ§¨ÛÂ« 0t€†€‡€‡x„€‡…€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ¹ S¡ºu€)Ò  ½ S¤¾¿¾¿vwvw€)0;Ó   ÆÉ ¢ÇÈyz¢ÊË{~€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ĞÓ ¢Ò€•|¢ÙÕ€Õ}€“^documentLengthÑÓ   ÚŞ £ÛÜİ€£ßàõ‚ƒ€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒç èı\NS.uuidbytesOƒmFl¦M,úû¢š›dÅ€Òë ìı\NS.uuidbytesOÌMº8ßB²¯™0ùM€#@      Ó   ğó ¢ò€›†¢ÙÕ€Õ}€“^documentLengthÓ   ù 8ªúûüışÿ ˆ‰Š‹Œ‘ª 0ÂÂ	7 .Â 0’€†€‡€‡–€·€…€‡¢€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ   S¡“€)Ò   S¤ ! !”•”•€)&Ó   (+ ¢)*—˜¢,-™Ÿ€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   26 £345š›œ£78õ€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ? @ı\NS.uuidbytesO[W²(P¡H´“jõ,Ö´€ÒC Dı\NS.uuidbytesOQH_@C¾ûg—ˆd×€Ó   GJ ¢I€• ¢ÙL€Õ¡€“^documentLengthÓ   QT ¢S€›£¢ÙL€Õ¡€“^documentLengthÓ   Ze 8ª[\]^_`abcd¥¦§¨©ª«¬­®ªf 0ÂÂjkÂn 0¯€†€‡€‡²¾€è€‡¿€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  | S¡}°€)Ò  € S¤vv±±€)@Ó   ˆ‹ ¢‰Š³´¢Œµ¸€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ’• ¢”€•¶¢—€—·€“^documentLength/Ó   œ  £Ÿ¹º»£¡¢õ¼½€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ© ªı\NS.uuidbytesOºŠş¿BG·a´}Êğu€Ò­ ®ı\NS.uuidbytesOKıÁ8ˆHW©ÃôÚtFù±€#@       Ó   ²µ ¢´€›À¢—€—·€“^documentLengthÓ   »Æ 8ª¼½¾¿ÀÁÂÃÄÅÂÃÄÅÆÇÈÉÊËªÇ 0ÂÂË7 .ÂÏ 0Ì€†€‡€‡Ï€·€…€‡Û€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  İ S¡ŞÍ€)Ò  á S¤âvâvÎÎ€)~Ó   éì ¢êëĞÑ¢íîÒÕ€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   óö ¢õ€•Ó¢Ùø€ÕÔ€“^documentLengthêÓ   ı £şÿ Ö×Ø£õÙ€’Ú€“_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒ
+ ı\NS.uuidbytesO5í|€H·‚ïÜJÏ†E€Ò ı\NS.uuidbytesO ·4ÚeÒE¦‡cOd/€Ó    ¢€›Ü¢Ùø€ÕÔ€“^documentLengthÓ   & 8ª !"#$%Şßàáâãäåæçª' 0ÂÂ+—ÛÂ/ 0è€†€‡€‡ë€×€‡÷€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  = S¡>é€)Ò  A S¤BvBvêê€)<Ó   IL ¢JKìí¢MNîñ€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   SV ¢U€•ï¢ÙX€Õğ€“^documentLength@Ó   ]a £^_`òóô£bõdõ€’ö€“_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒj kı\NS.uuidbytesOÄ€K”"EJ‘½Qº¹r8€Òn oı\NS.uuidbytesOıø·:úÆ@î¯Ì¼Òo…JS€Ó   ru ¢t€›ø¢ÙX€Õğ€“^documentLengthÓ   {† 8ª|}~€‚ƒ„…úûüışÿ ª‡ 0ÂÂ‹Å .Â 0€†€‡€‡€™€…€‡€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ   S¡€)Ò  ¡ S¤¢v¢v€)Ó   ©¬ ¢ª«	¢­®
+€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ³· £´µ¶£¸õº€’€“_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayControllerÒÀ Áı\NS.uuidbytesOÁ|íD²ùAm˜§«Ëy|œ€ÒÄ Åı\NS.uuidbytesO¤Ä ĞVŠFJ–æ;DîëÍ<€Ó   ÈË ¢É€•¢ÌÙ€Õ€“^documentLengthöÓ   ÒÕ ¢Ô€›¢ÙÌ€Õ€“^documentLengthÓ   Ûæ 8ªÜİŞßàáâãäåªç 0ÂÂë7 .Âï 0 €†€‡€‡#€·€…€‡/€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ı S¡ş!€)Ò   S¤ÅÅ""€)Ó   	 ¢
+$%¢&)€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ    ¢'€•¢Ù(€Õ€“^documentLength‡Ó   ! £ *+,£"#õ-.€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ* +ı\NS.uuidbytesOüGyÆ1€Gº›èz´ñàX€Ò. /ı\NS.uuidbytesOMŞ=§!—CE¾ûÖ¤£üå=€Ó   25 ¢4€›0¢Ù€Õ(€“^documentLengthÓ   ;F 8ª<=>?@ABCDE23456789:;ªG 0ÂÂK7 .ÂO 0<€†€‡€‡>€·€…€‡J€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ] S¡^=€)Ò  a S¤ . . . .€…€…€…€…€)Ó   hk ¢ij?@¢lmAD€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ru ¢sB€•¢vC€—€“^documentLength½Ó   |€ £}~EFG£‚õHI€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ‰ Šı\NS.uuidbytesOd D¤€ôAŞ9½îâ›’€Ò ı\NS.uuidbytesOıw[ºB'’$.€y© 3€Ó   ‘” ¢“€›K¢v€—C€“^documentLengthÓ   š¥ 8ª›œŸ ¡¢£¤MNOPQRSTUVª¦ 0ÂÂª—¬Â® 0W€†€‡€‡Z€×f€‡g€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ¼ S¡½X€)Ò  À S¤ÁvÁvYY€)JÓ   ÈË ¢ÉÊ[\¢ÌÍ]c€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ÒÖ £ÓÔÕ^_`£õØÙ€’ab€“_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒß àı\NS.uuidbytesOEAêòOJµ†ÿãG(åJ€Òã äı\NS.uuidbytesO	ĞX°MºZãì3’a€Ó   çê ¢é€•d¢Ùì€Õe€“^documentLengthÚ(Ó   òõ ¢ô€›h¢Ùì€Õe€“^documentLengthÓ   û 8ªüışÿ jklmnopqrsª 0ÂÂ
+Â 0t€†€‡€‡wƒ"€‡„€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ   S¡u€)Ò  ! S¤"÷"÷vwvw€)5Ó   ), ¢*+xy¢-.z€€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   37 £456{|}£8õ:~€’€“_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒ@ Aı\NS.uuidbytesO!rJrçF†µ¿u…âj€ÒD Eı\NS.uuidbytesO+ˆBé×N…»á%ØRs €Ó   HK ¢J€•¢ÙM€Õ‚€“^documentLength#@       Ó   SV ¢U€›…¢ÙM€Õ‚€“^documentLengthÓ   \g 8ª]^_`abcdef‡ˆ‰Š‹Œªh 0ÂÂl7 .Âp 0‘€†€‡€‡“€·€…€‡Ÿ€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ~ S¡’€)Ò  ‚ S¤ . . . .€…€…€…€…€)Ó   ‰Œ ¢Š‹”•¢–™€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   “– ¢•€•—¢˜€—˜€“^documentLength±Ó   ¡ £Ÿ š›œ£¢£õ€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒª «ı\NS.uuidbytesO&ş,•”‹KÌ¡ÓşMT¡Eï€Ò® ¯ı\NS.uuidbytesOœÆ#ï?Jƒ¢óøè‚Ñğ,€Ó   ²µ ¢´€› ¢˜€—˜€“^documentLengthÓ   »Æ 8ª¼½¾¿ÀÁÂÃÄÅ¢£¤¥¦§¨©ª«ªÇ 0ÂÂËÅ .ÂÏ 0¬€†€‡€‡¯€™€…€‡»€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  İ S¡Ş­€)Ò  á S¤âãâã†®†®€)Ó   éì ¢êë°±¢íî²µ€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   óö ¢ô³€•¢÷Ù´€Õ€“^documentLength
+Ó   ı £şÿ ¶·¸£õ€’¹º€“_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayControllerÒ
+ ı\NS.uuidbytesOT¢7è=Iu»•ƒÕ“-]Ä€Ò ı\NS.uuidbytesOëÁ£‡H[…=ÁQ.Y°×€Ó    ¢€›¼¢Ù÷€Õ´€“^documentLengthÓ   & 8ª !"#$%¾¿ÀÁÂÃÄÅÆÇª' 0ÂÂ+7 .Â/ 0È€†€‡€‡Ê€·€…€‡Ö€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  = S¡>É€)Ò  A S¤ZvZv––€)Ó   HK ¢IJËÌ¢LMÍÓ€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   RV £STUÎÏĞ£WõYÑ€’Ò€“_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.width_&SourceCodeEditor.playgroundResultStoreÒ_ `ı\NS.uuidbytesOó¦}²©M©³Vòª€Òc dı\NS.uuidbytesOt¨'p@;¤0+(ğ€Ó   gj ¢i€•Ô¢Ùl€ÕÕ€“^documentLength
+Ó   qt ¢s€›×¢Ùl€ÕÕ€“^documentLengthÓ   z… 8ª{|}~€‚ƒ„ÙÚÛÜİŞßàáâª† 0ÂÂŠ7 .Â 0ã€†€‡€‡å€·€…€‡ğ€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  œ S¡ä€)Ò    S¤ . . . .€…€…€…€…€)Ó   §ª ¢¨©æç¢«¬èî€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ±µ £²³´éêë£¶·õìí€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ¾ ¿ı\NS.uuidbytesO*ExVåE …¨>û D€ÒÂ Ãı\NS.uuidbytesOo{Q'¹ÄOóŸ4Z V9°€Ó   ÆÉ ¢Çï€•¢v€—€“^documentLengthÓ   ÏÒ ¢Ñ€›ñ¢v€—€“^documentLengthÓ   Øã 8ªÙÚÛÜİŞßàáâóôõö÷øùúûüªä 0ÂÂèÄÂì 0ı€†€‡€‡ÿÏ€‡€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ú S¡ûş€)Ò  ş S¤ÁvÁvYY€)Ó    ¢ ¢	
+€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ    ¢€•¢Ù€Õ€“^documentLengthqÓ    ££õ	
+€’€“_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStore_SourceCodeEditor.sidebar.widthÒ& 'ı\NS.uuidbytesOŠmÎ¿³LL°¤Ûg ôÊ€Ò* +ı\NS.uuidbytesOĞ átDe¹÷hôç=œ6€Ó   .1 ¢0€›¢Ù€Õ€“^documentLengthÓ   7B 8ª89:;<=>?@AªC 0ÂÂGÅ .ÂK 0€†€‡€‡€™€…€‡&€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  Y S¡Z€)Ò  ] S¤]v]vYY€)Ó   dg ¢ef¢hi €“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   nq ¢p€•¢Ùs€Õ€“^documentLengthäÓ   x| £yz{!"#£õ~€’$%€“_SourceCodeEditor.sidebar.width_/SourceCodeEditor.playgroundToyDisplayController_&SourceCodeEditor.playgroundResultStoreÒ… †ı\NS.uuidbytesO8:Ì¹HLH³˜É¯¥™Ù€Ò‰ Šı\NS.uuidbytesOúrÆF¿Í¦³Ø˜Ô€Ó    ¢€›'¢Ùs€Õ€“^documentLengthÓ   –¡ 8ª—˜™š›œŸ )*+,-./012ª¢ 0ÂÂ¦7 .Âª 03€†€‡€‡5€·€…€‡A€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  ¸ S¡¹4€)Ò  ¼ S¤ . . . .€…€…€…€…€)Ó   ÃÆ ¢ÄÅ67¢ÇÈ8;€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ÍĞ ¢Î9€•¢Ñ:€—€“^documentLength„Ó   ×Û £ØÙÚ<=>£Üİõ?@€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒä åı\NS.uuidbytesO|RõqïÖBî ³Vøcî€Òè éı\NS.uuidbytesOÏİé5Ö#B$˜n¿Oò¾Ú€Ó   ìï ¢î€›B¢Ñ€—:€“^documentLengthÓ   õ  8ªö÷øùúûüışÿDEFGHIJKLMª 0ÂÂÅ .Â	 0N€†€‡€‡R€™€…€‡^€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ   S¡O€)Ò   S¤PQPQ€)
+Ó   $' ¢%&ST¢()U[€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   .2 £/01VWX£34õYZ€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ; <ı\NS.uuidbytesOèU^q3[Bºˆ	.iiÊ×€Ò? @ı\NS.uuidbytesO£ƒÔbˆOp¯áóÙüa²D€Ó   CF ¢D\€•¢G]€—€“^documentLength$Ó   MP ¢O€›_¢G€—]€“^documentLengthÓ   Va 8ªWXYZ[\]^_`abcdefghijªb 0ÂÂf7 .Âj 0k€†€‡€‡m€·€…€‡y€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  x S¡yl€)Ò  | S¤	}	}PÍPÍ€)Ó   ƒ† ¢„…no¢‡ˆps€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ    ¢q€•¢‘r€—€“^documentLengthÓ   —› £˜™štuv£œõwx€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ¤ ¥ı\NS.uuidbytesOœpS<¦K¬©L¥wh­€Ò¨ ©ı\NS.uuidbytesOÅåB«:YGı§ï ŸàÇ€Ó   ¬¯ ¢®€›z¢‘€—r€“^documentLengthÓ   µ· 8¡¶|¡¸~€Ó U  V W X½€ €}_Tfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp.xcodeprojÓ   ÀÅ 8¤ÁÂÃÄ€‚¤ÆÇÈÉƒ„…€_-Xcode3ProjectEditorPreviousProjectEditorClass_,Xcode3ProjectEditorPreviousTargetEditorClass_,Xcode3ProjectEditorSelectedDocumentLocations_&Xcode3ProjectEditor_Xcode3TargetEditor_Xcode3ProjectInfoEditor_Xcode3TargetEditorÒ  Ò S¡Ó†€)ÔÖ×Ø ÙÚÛÜYselectionYtimestamp[documentURL‰ˆ‡_Tfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp.xcodeproj#AÆÎªº¤©Ó   àã 8¢áâŠ‹¢äåŒ€VEditorVTarget_Xcode3TargetEditor[TheMealsAppÒ \ ]ìí_Xcode3ProjectDocumentLocation£îï `_Xcode3ProjectDocumentLocation_DVTDocumentLocationÓ   ñò 8  €Ó   õø 8¢ö÷‘“¢ùú•€Ó U  V W Xÿ€ €’_2x-xcode-log://DE4259B5-7817-44E7-8091-BC59E4CDE608Ó U  V W X€ €”_2x-xcode-log://55CEB2A9-122B-4C7C-8B4C-1B6CFB5F6402Ó   	 8¡–¡
+—€_SelectedDocumentLocationsÒ   S¡˜€)Õ ×Ø Wâÿ_expandTranscriptYindexPath€ ’™Ó ³_NSIndexPathLength_NSIndexPathDatašœÒ  !WNS.dataB›Ò \ ]#$]NSMutableData£#% `VNSDataÒ \ ]'([NSIndexPath¢) `[NSIndexPathÒ \ ]+,_IDELogDocumentLocation£-. `_IDELogDocumentLocation_DVTDocumentLocationÓ   02 8¡1Ÿ¡3 €_SelectedDocumentLocationsÒ  7 S¡8¡€)Õ ×Ø Wâ?€ ”¢Ó ³A£œÒ D!B ›Ó   GI 8¡ J€¡J¥€Ó   MV 8¨NOPQRSTU¦§¨©ª«¬­¨WXYZ[\]^®±³´µ¶»¼€_selectedItemIdentifiers[sourceItems_detailController_preferredSourceListWidth]sclicing-area_source-list-area_lastFocusedArea]overview-areaÒ  ik¡j¯°_B./assetNoFavorite.imageset/[universal][][][1x][][][][][][][][][][]Ò \ ]no\NSMutableSet£np `UNSSetÒ  rk¡s²°_./assetNoFavorite.imageset_IBICCatalogOverviewController#@lÀ     Ó   yz 8  €Ó   } 8¡~·¡€¸€_expandedItemIDsÒ  „†¡…¹ºQ.Ò \ ]p‰¢p `ZdetailAreaÓ   Œ 8  €Ó   ’ ¡‘¾¡“¿€“]IDENameString[TheMealsAppÑ ˜ÁÒ \ ]š›VNSNull¢š `Ò   S¡ €€)Ó   ¡£ 8¡ €¡¤Ä€Ò  §©¡ €ÅÒ \ ]«¬^NSMutableArray£«  `Ó   ®² £¯°±ÇÈÉ£³´µÊÎÒ€“_IDERunContextRecentsSchemesKey_5IDERunContextRecentsLastUsedRunDestinationBySchemeKey_&IDERunContextRecentsRunDestinationsKeyÓ   »½ 8¡¼Ë¡¾Ì€[TheMealsAppÒÂ ÃÄWNS.time#AÆÎè0î¿ÍÒ \ ]ÆÇVNSDate¢Æ `Ó   ÉË 8¡ÊÏ¡ÌĞ€[TheMealsAppÒ ĞÑÒYNS.stringÑ_;7A60B588-4926-4A88-9679-4FA36F2ECDD0_iphonesimulator_x86_64Ò \ ]ÔÕ_NSMutableString£ÔÖ `XNSStringÓ   ØÚ 8¡ÙÓ¡ÛÔ€_;7A60B588-4926-4A88-9679-4FA36F2ECDD0_iphonesimulator_x86_64ÒÂ ßÄ#AÆÎè1'èOÍÓ   âí ªãäåæçèéêëìÖ×ØÙÚÛÜİŞßª 0ï 0Âòóôõö÷€†à€†€‡áâãäåæ€“ZisEligible_targetDevicePlatform_targetDeviceIsConcrete_targetDeviceIsWireless_targetSDKVariant_targetDeviceLocation_targetArchitectureYtargetSDK_targetDeviceFamily_targetDeviceModelCode_iphonesimulator_iphonesimulator_>dvtdevice-iphonesimulator:7A60B588-4926-4A88-9679-4FA36F2ECDD0Vx86_64_iphonesimulator18.2ViPhoneZiPhone17,1Ò  © ÅÓ    8¤éêëì¤íîïğ€_IDEActivityReportTitle_IDEActivityReportVersion_IDEActivityReportOptions_0IDEActivityReportCompletionSummaryStringSegmentsUBuildX16C5032aêÒ  !©£"#$ñöùÅÓ   '+ 8£()*òóô£k-¾õí€_&IDEActivityReportStringSegmentPriority_+IDEActivityReportStringSegmentBackSeparator_)IDEActivityReportStringSegmentStringValueQ Ó   59 8£()*òóô£á;<…÷ø€c  %  Ò @!Obplist00Ô
+X$versionY$archiverT$topX$objects † _NSKeyedArchiverÑ	Troot€¯)*0:;<#=AIJKLMSWX\_U$nullÓXNSStringV$class\NSAttributes€€€YSucceededÓWNS.keysZNS.objects¡€¡€€VNSFontÖ !"#$%&'(VNSSizeXNSfFlags\NSDescriptorZNSHasWidthVNSName#@&      ˆ€€€_.AppleSystemUIFontBoldÓ+,-./_NSFontDescriptorOptions_NSFontDescriptorAttributes€€„€Ó15£234€	€
+€£678€€€€_NSFontSizeAttribute_ NSCTFontFeatureSettingsAttribute_NSCTFontUIUsageAttributeÒ>@¡?€€ÓBE¢CD€€¢FG€€€_CTFeatureSelectorIdentifier_CTFeatureTypeIdentifier ÒNOPQZ$classnameX$classes\NSDictionary¢PRXNSObjectÒNOTU^NSMutableArray£TVRWNSArray_CTFontBoldUsageÒNOYZ_NSFontDescriptor¢[R_NSFontDescriptorÒNO]^VNSFont¢]RÒNO`a_NSAttributedString¢bR_NSAttributedString    $ ) 2 7 I L Q S o u | … Œ ™ ›  Ÿ © ° ¸ Ã Å Ç É Ë Í Ô á è ñ ş	!#<C]z|ƒŠ’”˜šœ ¶Ùôùûıÿ	4NPRWbkx{„‰˜œ¤¶»ÎÑäéğóø             c              %›Ó   CJ 8¦(EF*HIòúûôüı¦GvMNvvfşÿ€_"IDEActivityReportStringSegmentType_"IDEActivityReportStringSegmentDate_'IDEActivityReportStringSegmentDateStyle_'IDEActivityReportStringSegmentTimeStyleÒÂ WÄ#AÆÎöx`Ë}Ío T o d a y   a t   5 . 0 8 / A MÓ   [d 8¨\]^_`abc¨ 0f 0hÂ_ 0Â€†	€†
+€‡€†€‡€_IDEWindowIsFullScreen^IDEWindowFrame_-IDEHasMigratedValuesFromNSRestorableStateData_>IDEWorkspaceTabController_75DACF4F-9477-44F2-97BD-12677AFE5FB7_&IDEWindowTabBarWasVisibleWithSingleTab_IDEActiveWorkspaceTabController_IDEWindowToolbarIsVisible_IDEWindowTabBarIsVisible_209 109 1400 900 0 0 1680 1050 Ó   x‚ 8©yz{|}~€© 0„…†‡ˆ‰Â‹€†Z[_`b€‡e€_IDEShowNavigator_IDENavigatorArea_IDEUtilitiesWidth_IDEInspectorArea_IDENavigatorWidth\ViewDebugger_MemoryGraphDebugger_IDEShowUtilities]IDEEditorAreaÓ   — 8¦˜™š›œ¦Ÿ ¡¢£¤'7BCI€_ Xcode.IDEKit.Navigator.Workspace_Xcode.IDEKit.Navigator.Find_"Xcode.IDEKit.Navigator.Test.Modern_SelectedNavigator_GroupSelections_#Xcode.IDENoticesKit.NoticeNavigatorÓ   ­² 8¤®¯°±¤³´µ³ !" €_FilterStateByModeKey_LastNavigatorMode_UnfilterStateByModeKey_FilteredUIStateByModeKeyÓ   ½¾   €“_IDENavigatorModeSolitaryÓ   ÂÄ ¡Ã#¡Å$€“_IDENavigatorModeSolitaryÒ ÉÊË_codablePlistRepresentation&%O%bplist00ÔÀÄ_lastAccessedDateYitemState]selectedItems^scrollPosition3AÆÏ«µá¯L!#%'),.358:>@CEHJNPRTVXZ\^`cegikmoqsuxz}‚„†ˆŠŒ’”—™› ¢¤¦©«­¯²´¶¸º¼¾Ò	
+TpathYindexHint¥[TheMealsAppVModuleVSearchVRouterÒ^expansionState3AÆÎõ"¹äi Ò	¤XFavoriteÒ3AÆÎõ"¹‰'Ò	¦TCoreTDataVRemoteXResponseÒ 3AÆÎõ"’Ò	"¥Ò$3AÆÎõ"¹‘hÒ	&¦Ò(3AÆÎõ2;p‹Ò	*¡+_Package DependenciesÒ-3AÆÎõ"¹ıÒ	/2¥01UUtilsWNetworkÒ43AÆÎõ"¹RÒ	6¤7RDIÒ93AÆÎõ"¹!Ò	;=¤<THomeÒ?3AÆÎõ"¹­\Ò	A=¥<BTViewÒD3AÆÎõ"¹Å½Ò	F=¥GBVDetailÒI3AÆÎõ"¹Ò	K¥LMVDomainUModelÒO3AÆÎõ"¹âÒ	Q=¥BÒS3AÆÎõ"¹îîÒ	U£ÒW3AÆÎõ"¸È`Ò	Y=¥BÒ[3AÆÎõ"¹œsÒ	]=£Ò_3AÆÎõ"¹b Ò	a¥GbYPresenterÒd3AÆÎõ"¹n“Ò	f¥<bÒh3AÆÎõ"¹°`Ò	j¢Òl3AÆÎõ"¸´ĞÒ	n¤GÒp3AÆÎõ"¹kìÒ	r¡Òt3AÆÎõ"¸j‡Ò	v¥LwWUseCaseÒy3AÆÎõ"¹-4Ò	{¥|VLocaleÒ~3AÆÎõ1ÑWÒ	€¤Òƒ3AÆÎõ"¹ÛõÒ	…=¤LÒ‡3AÆÎõ"¹ZÒ	‰¥bÒ‹3AÆÎõ"¹Ş”Ò	¥bÒ3AÆÎõ"¹‹ÖÒ	‘¥0BÒ“3AÆÎõ"¹BöÒ	•2¤–TMealÒ˜3AÆÎõ"¹ÑÒ	š¥Òœ3AÆÎõ"¸öàÒ	£ŸSAppÒ¡3AÆÎõ"¸¼{Ò	£2¤0Ò¥3AÆÎõ"¹9—Ò	§¦|¨VEntityÒª3AÆÎõ0§çÒ	¬¦|¨Ò®3AÆÎõ"’üÒ	°=¥0±VMapperÒ³3AÆÎõ"¹NÓÒ	µ¥<Ò·3AÆÎõ"¹·1Ò	¹¥GÒ»3AÆÎõ"¹tÒ	½¤Ò¿3AÆÎõ"¸Ó•¡ÁÒ	Â¦<BÃ^HomeView.swift¢ÅÈ¢ÆÇ#        #À$      ¢ÉÊ#@tø     #@Ø        $ . < K T £ ¨ ­ · ½ É Ğ × Ş à å ô ı ÿ	 %,16=FKTY_dmry~‡Œ¥ª³¸¾ÄÌÎÓÜáæéî÷ü!&+49?FKTY_flqz…Š“˜œ¡ª¯µºÃÈÌÑÚßåïôı#,16;DIKPY^dlqz…Œ‘šŸ¤¦«´¹¾ÃÌÑ×Üåêğõş	!&+49?DMRVZ_hmrw€…Œ“˜¡¦­²»ÀÆÍÒÛàæëôùÿ%',3BEHQZ]f             Ë              oÒ \ ]ÎÏ_&ExplorableOutlineViewArchivableUIState£ĞÑ `_&ExplorableOutlineViewArchivableUIState_b_TtGCV16DVTExplorableKit26ExplorableOutlineViewTypes7UIState_VS_31ExplorableStateSavingIdentifier_Ó   ÓÖ 8¢ÔÕ()¢×Ø*6€_queryParametersController]filterPatternÓ   İá 8£Şßà+,-£âãä./5€_lastEasyToInitiateQueryClass_querySpecification[queryAction_IDEBatchFindTextQueryÔëìí î WğñYqueryTermZnamedScopeZqueryClass0€ 34Ó óôõöàTtextXtermType21Ò ĞÑùÑWmissingÒ \ ]ûü_IDEBatchFindQueryTerm¢ı `_IDEBatchFindQueryTerm_IDEBatchFindTextQueryÒ \ ] _IDEBatchFindQuerySpecification¢ `_IDEBatchFindQuerySpecificationTfindPÓ    8¤	
+89:;¤<=><€_FilterStateByModeKey_LastNavigatorMode_UnfilterStateByModeKey_FilteredUIStateByModeKeyÓ      €“_IDENavigatorModeSolitaryÓ    ¡?¡@€“_IDENavigatorModeSolitaryÒ "Ê$_codablePlistRepresentation&AO²bplist00Ô_lastAccessedDateYitemState]selectedItems^scrollPosition3AÆÎ¬Õ…¾  ¢	¢
+#        #À$      ¢#@q      #@Œø     $.<KTUVY\enqz                            ƒ_ Xcode.IDEKit.Navigator.WorkspaceÓ   (- 8¤)*+,DEFG¤.¢™šHB€_"Xcode.IDEKit.NavigatorGroup.Issues_%Xcode.IDEKit.NavigatorGroup.Structure_ Xcode.IDEKit.NavigatorGroup.Find_ Xcode.IDEKit.NavigatorGroup.Test_#Xcode.IDENoticesKit.NoticeNavigatorÓ   9> 8¤:;<=JKLM¤?@ABNQRV€_FilterStateByModeKey_LastNavigatorMode_UnfilterStateByModeKey_FilteredUIStateByModeKeyÓ   IK ¡JO¡LP€“_IDENavigatorModeSolitaryOnbplist00Ô
+X$versionY$archiverT$topX$objects † _NSKeyedArchiverÑ	Troot€©!$'+,U$nullÕV$class\operatorType_tokenFieldObjectValue_recentFilterItems_enabledButtonFilterIdentifiers€ €€€ÒZNS.objects €ÒZ$classnameX$classesWNSArray¢ XNSObjectÒ"# €Ò%&^NSMutableArray£% Ò(#¡)€€_IDEFilterIdentifier_NoticeErrorÒ-.__DVTFilterExpressionStateValue¤/01 __DVTFilterExpressionStateValue__DVTFilterTokenStateValue__DVTFilterTokenFieldValue    $ ) 2 7 I L Q S ] c n u ‚ š ® Ï Ñ Ó Õ × Ù Ş é ê ì ñ ü!&59>@BDfkŒ‘²Î             2              ê_IDENavigatorModeSolitaryÓ   RT ¡SS¡UT€“_IDENavigatorModeSolitaryÒ YÊ[_codablePlistRepresentation&UO_bplist00Ô_lastAccessedDateYitemState]selectedItems^scrollPosition3AÆÎõñÖb¤Ò	
+TpathYindexHint¢[TheMealsApp_$Missing package product 'RealmSwift' Ò^expansionState3AÆÎïåÜãÒ	¡Ò3AÆÎïåÜã7 ¢¢#        #À$      ¢#@q      #@Ø        $ . < K T Y ^ c m p | £ ¥ ª ¹ Â Ç É Î × Ø Û Ş ç ğ ó ü                           Ó   ^` ¡_W¡aX€“_IDENavigatorModeSolitaryÒ eÊg_codablePlistRepresentation&YO4bplist00Ô_lastAccessedDateYitemState]selectedItems^scrollPosition3AÆÎõñ×€¤Ò	
+TpathYindexHint¡[TheMealsApp Ò^expansionState3AÆÎñÿ”<¸Ò	¢_RemoteDataSource.swiftÒ3AÆÎğ“©ä? ¢¢#        #À$      ¢#@‚d     #@Ø     $.<KTY^cmo{}‚‘šŸ¢»ÀÉÊÍĞÙâåî                            ÷#@p@     Ó   kn 8¢lm\]¢p€—^€_'userPreferredInspectorGroupExtensionIDs_!userPreferredCategoryExtensionIDsÒ  u© Å#@tø     Ó   y{ 8¡za¡ 0€†€_ShowsOnlyVisibleViewObjectsÓ   €ƒ 8¢‚cd¢ÂÂ€‡€‡€_ShowsOnlyLeakedBlocks_XRShowsOnlyContentFromWorkspaceÓ   Š– 8«‹Œ‘’“”•fghijklmnop«— .™š›œŸ ¡q€…rstu|†’“¯€_ SelectedEditorAreaSplitIndexPath_*BeforeComparisonMode_UserVisibleEditorMode_NavigationStyleZEditorMode_ DefaultPersistentRepresentations_EditorAreaSplitStates_#primaryEditorArchivedRepresentation_DebuggerSplitView^MaximizedState_IDEDefaultDebugArea_ EditorMultipleSplitPrimaryLayoutÓ¯ {à_NSIndexPathValueœZOpenInTabs Ó   ´µ 8  €Ò  ¸©¡¹vÅÓ   ¼Ã 8¦½¾¿ÀÁÂwxyz{|¦ÄÅÆÄÈÂ}~R}{€‡€ZEditorMode_EditorTabBarState_EditorHistoryStacks]EditorMode13+[ItemKindKey_ShouldShowPullRequestCommentsÓ   ÓÖ 8¢ÔÕ€¢× .€…€_TabsAsHistoryItems_SelectedTabIndexÒ  İ S¥Şßàáâ‚¹Ù+€)Øåæçè éêëìíîïğñ Ió_documentNavigableItemName_!fileDataType.stringRepresentation_stateDictionary_navigableItemRepresentation_navigableItemName[documentURL_documentExtensionIdentifier‡šœƒ¸·€›Öõö÷ øùúûüış ._DocumentLocation^IdentifierPath_WorkspaceRootFilePath_DomainIdentifier_IndexOfDocumentIdentifier“…–™„€…_/Xcode.IDENavigableItemDomain.WorkspaceStructureÒ   S¦†‰‹‘€)Ó ì .ZIdentifierUIndex‡€…ˆ^HomeView.swiftÒ \ ]_IDEArchivableStringIndexPair¢ `_IDEArchivableStringIndexPairÓ ®Š€ÈˆTViewÓ ®Œ€ÈˆTHomeÓ  ®€ÈˆVModuleÓ % .€…ˆ[TheMealsAppÓ * .’€…ˆ[TheMealsAppÓØ ×/0 W”•€ _jfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Home/View/HomeView.swiftÒ \ ]45_DVTDocumentLocation¢6 `_DVTDocumentLocationÒ 89:ZpathString˜—_M/Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp.xcodeprojÒ \ ]=>[DVTFilePath£?@ `[DVTFilePath_PackedPathEntryÒ \ ]BC_(IDENavigableItemArchivableRepresentation¢D `_(IDENavigableItemArchivableRepresentation_public.swift-source_-Xcode.IDEKit.EditorDocument.PegasusSourceCodeÓ   HS 8ªIJKLMNOPQRŸ ¡¢£¤¥¦ªT 0ÂÂX
+Â\ 0§€†€‡€‡ªƒ"€‡µ€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  j S¡k¨€)Ò  n S¤	Şp	Şşê©ê^€)Ó   vy ¢wx«¬¢z{­¯€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   €ƒ ¢‚€•®¢M€—‚€“^documentLengthÓ   ‰ £Š‹Œ°±²£õ³´€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ– —ı\NS.uuidbytesO+ˆBé×N…»á%ØRs €Òš ›ı\NS.uuidbytesO!rJrçF†µ¿u…âj€Ó   ¡ ¢ €›¶¢M€—‚€“^documentLength^errorIndicatorÒ \ ]¨©_IDEEditorHistoryItem¢ª `_IDEEditorHistoryItemØåæçè éêë¬­®¯ğ± J –½ÃÄº¸Ø€€.Öõö÷ øùµ¶üış .Á»–™„€…Ò  ¼ S£½¾¿¼¾¿€)Ó ¬ÿ½_ˆ_Assets.xcassetsÓ % .€…ˆÓ Ë .À€…ˆ[TheMealsAppÓØ ×Ğ0 WÂ•€ _Zfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Assets.xcassets_com.apple.dt.assetcatalogÓ   Öß 8¨×ØÙÚÛÜİŞÅÆÇÈÉÊËÌ¨àáâZäåæçÍÏÑ´ÒÓÖ×€_selectedItemIdentifiers[sourceItems_detailController_preferredSourceListWidth]sclicing-area_source-list-area_lastFocusedArea]overview-areaÒ  òk¡óÎ°_B./assetNoFavorite.imageset/[universal][][][1x][][][][][][][][][][]Ò  ÷k¡øĞ°_./assetNoFavorite.imageset_IBICCatalogOverviewControllerÓ   ış 8  €Ó    8¡Ô¡Õ€_expandedItemIDsÒ  †¡…¹ºZdetailAreaÓ    8  €\Universal 1xØåæçè éêëíğ MóİšçÚ¸€›Öõö÷ øùüış .åÛ–™„€…Ò  " S¦#$%&'(ÜŞàáâã€)Ó  .İ€…ˆ_HomePresenter.swiftÓ 0 .ß€…ˆYPresenterÓ ®Œ€ÈˆÓ  ®€ÈˆÓ % .€…ˆÓ A .ä€…ˆ[TheMealsAppÓØ ×F0 Wæ•€ _tfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Home/Presenter/HomePresenter.swiftÓ   KV 8ªLMNOPQRSTUèéêëìíîïğñªW 0ÂÂ[¨ÛÂ_ 0ò€†€‡€‡ô„€‡ÿ€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  m S¡nó€)Ò  q S¤¾¿¾¿vwvw€)Ó   x{ ¢yzõö¢|}÷ù€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   ‚… ¢„€•ø¢Õ€—}€“^documentLengthÓ   ‹ £Œúûü£‘õış€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ˜ ™ı\NS.uuidbytesOƒmFl¦M,úû¢š›dÅ€Òœ ı\NS.uuidbytesOÌMº8ßB²¯™0ùM€Ó    £ ¢¢€› ¢Õ€—}€“^documentLength_linkBuilder(for:content:)Øåæçè éêëªí¬­ğ¯ Lóš¸*€›Öõö÷ øù³´üış .–™„€…Ò  º S¦»¼½¾¿À	
+€)Ó ª .€…ˆ_HomeRouter.swiftÓ ÈvˆVRouterÓ ®Œ€ÈˆÓ  ®€ÈˆÓ % .€…ˆÓ Ù .€…ˆ[TheMealsAppÓØ ×Ş0 W•€ _nfile:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/Module/Home/Router/HomeRouter.swiftÓ   ãî 8ªäåæçèéêëìíªï 0ÂÂó7 .Â÷ 0€†€‡€‡€·€…€‡(€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ   S¡€)Ò  	 S¤Ú®Ú®€È€È€)Ó    ¢¢ "€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ    ¢!€•¢è¢€—€“^documentLengthÓ   #' £$%&#$%£()õ&'€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ0 1ı\NS.uuidbytesOpSz…n Bl ÂC)TÍ*€Ò4 5ı\NS.uuidbytesO@jH«á3IM¬" TÛ¡pz€Ó   8; ¢:€›)¢è€—¢€“^documentLengthZHomeRouterØåæçè éêëBíDEğG Kó/š7,¸Q€›Öõö÷ øùKLüış .5-–™„€…Ò  R S¤STUV.023€)Ó Bv/ˆ_ContentView.swiftÓ ^ .1€…ˆSAppÓ % .€…ˆÓ g .4€…ˆ[TheMealsAppÓØ ×l0 W6•€ _`file:///Users/ben/belajar/ios-dicoding/example-ios/TheMealsApp/TheMealsApp/App/ContentView.swiftÓ   q| 8ªrstuvwxyz{89:;<=>?@Aª} 0ÂÂÄÅÂ… 0B€†€‡€‡D€‡O€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  “ S¡”C€)Ò  — S¤ÚÛÚÛ€)Ó   ¡ ¢Ÿ EF¢¢£GM€“_ PlaygroundResultsLayoutExtension_DeltaEditorLayoutExtensionÓ   ¨¬ £©ª«HIJ£­®õKL€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒµ ¶ı\NS.uuidbytesOë._şgII©¸†Äk1M€Ò¹ ºı\NS.uuidbytesOyiWùç AJ‰õ#Nñ–m€Ó   ½À ¢¿€•N¢€—€“^documentLengthÓ   ÆÉ ¢È€›P¢€—€“^documentLengthTbodyÒ  Ğ©¡ÑSÅÒÔ ÕÖ_currentEditorHistoryItemTzØåæçè éêëìíÚÛğİ Ió‡š_U¸y€›Öõö÷ øùáâüış .^V–™„€…Ò  è S¦éêëìíîWXYZ[\€)Ó ì .‡€…ˆÓ ®Š€ÈˆÓ ®Œ€ÈˆÓ  ®€ÈˆÓ % .€…ˆÓ  .]€…ˆ[TheMealsAppÓØ ×/0 W”•€ Ó    8ª`abcdefghiª 0ÂÂ
+Â" 0j€†€‡€‡lƒ"€‡w€†€_SourceCodeEditor.selection_SourceCodeEditor.showMinimap_!SourceCodeEditor.showCodeCoverage_SourceCodeEditor.showInvisibles_!SourceCodeEditor.layoutExtensions_#SourceCodeEditor.scrollState.offset_!SourceCodeEditor.scrollState.line_SourceCodeEditor.showAuthors_SourceCodeEditor.codeFolding_SourceCodeEditor.wrapLinesÒ  0 S¡1k€)Ò  4 S¤"÷"÷vwvw€)Ó   ;> ¢<=mn¢?@oq€“_DeltaEditorLayoutExtension_ PlaygroundResultsLayoutExtensionÓ   EH ¢G€•p¢M€—‚€“^documentLengthÓ   NR £OPQrst£STõuv€’€“_&SourceCodeEditor.playgroundResultStore_/SourceCodeEditor.playgroundToyDisplayController_SourceCodeEditor.sidebar.widthÒ[ \ı\NS.uuidbytesO+ˆBé×N…»á%ØRs €Ò_ `ı\NS.uuidbytesO!rJrçF†µ¿u…âj€Ó   cf ¢e€›x¢M€—‚€“^documentLengthZemptyGamesÒ \ ]mn_IDEEditorHistoryStack¢o `_IDEEditorHistoryStack_ItemKind_EditorÖõö÷ øùrsüış .…}–™„€…Ò  y S¦z{|}~~€‚ƒ€)Ó ì .‡€…ˆÓ ®Š€ÈˆÓ ®Œ€ÈˆÓ  ®€ÈˆÓ % .€…ˆÓ – .„€…ˆ[TheMealsAppÓØ ×/0 W”•€ Ó   Ÿ¡ 8¡ ‡¡¢ˆ€_DVTSplitViewItemsÒ  ¦©¢§¨‰ÅÓ   «¯ £¬­®Š‹Œ£° 0²€†€“]DVTIdentifier\DVTIsVisible_DVTViewMagnitudeYIDEEditor#@8     Ó   º¾ £¬­®Š‹Œ£¿ 0Á€†‘€“_IDEDebuggerArea#@\À      Ó   ÇÌ 8¤ÈÉÊË”•–—¤ÍÎ .Ğ˜€…¦€XLeftViewYRightViewZLayoutMode_IDESplitViewDebugAreaÓ   ×Ü 8¤ØÙÚÛ™š›œ¤Â . 0€‡€…€—€†€_VariablesViewShowsRawValues_VariablesViewSelectedScope_ VariablesViewViewSortDescriptors_VariablesViewShowsTypeÓ   çğ 8¨èéêëìíîïŸ ¡¢£¤¥¨ÂÂÂ 0ÂÂÂÂ€‡€‡€‡€†€‡€‡€‡€‡€_+IDEStructuredConsoleAreaLibraryEnabledState_-IDEStructuredConsoleAreaTimestampEnabledState_*IDEStructuredConsoleAreaPIDTIDEnabledState_,IDEStructuredConsoleAreaMetadataEnabledState_(IDEStructuredConsoleAreaTypeEnabledState_-IDEStructuredConsoleAreaSubsystemEnabledState_/IDEStructuredConsoleAreaProcessNameEnabledState_,IDEStructuredConsoleAreaCategoryEnabledStateÓ    8¡§¡¨€_DVTSplitViewItemsÒ  
+©¢©¬ÅÓ    £¬­®Š‹Œ£ 0ª€†«€“XLeftView#@s`     Ó    £¬­®Š‹Œ£ Â"­€‡®€“YRightView#@|      _Layout_LeftToRight         "   ,   1   :   ?   Q   V   \   ^  Â  È  Õ  İ  è  ï  ô  ö  ø  ı  ÿ        B  O  l  n  p  r  t  v  x  z  |  ~  €  ‚  „  †  ˆ  ¥  §  ©  ¬  ¯  ±  ´  ¶  ¹  ¼  ¿  Â  Å  È  Ê  Ì  ç      1  X  j  €    ±  È  â  ô  '  >  G  \  ^  `  b  d  f  h  j  l  n  p  r    ‡  “  •  —  ™        #  )  .  7  D  F  H  J  §  ´  ¶  ¸  º    *  ,  .  0  ¡  ®  °  ²  ´  +  8  :  <  >  ·  Ä  Æ  È  Ê  8  E  G  I  K  Á  Î  Ğ  Ò  Ô  @  M  O  Q  S  Ã  Ì  Ô  Ù  æ  ï  ñ  ó  õ  ÷               =  w  ¡  Ì  Ù  6  8  :  <  >  @  B  D  F  H  J  L  N  P  R  T  V  X  Z  \  ^  `  b  d  f  h  j  l  n  p  r  t  v  x  z  |  ~  €  ‚  „  †  ˆ  Š  Œ      í  ï  ñ  ó  õ  ÷  ú  ı         	                !  $  '  *  -  0  3  6  9  <  ?  B  E  H  K  N  Q  T  W  Z  ]  `  c  f  i  l  o  q  ~  €  ‚  „  ú    	      ‚    ‘  “  •          !  –  £  ¥  §  ©  )  6  8  :  <  ¯  ¼  ¾  À  Â  <  I  K  M  O  Å  Ò  Ô  Ö  Ø  H  U  W  Y  [  Ğ  İ  ß  á  ã   \   i   k   m   o   ä   ñ   ó   õ   ÷  !l  !y  !{  !}  !  !ğ  !ı  !ÿ  "  "  "}  "Š  "Œ  "  "  "ÿ  #  #  #  #  #w  #„  #†  #ˆ  #Š  #ğ  #ı  #ÿ  $  $  $‚  $  $‘  $“  $•  %  %  %  %  %  %™  %¦  %¨  %ª  %¬  &  &&  &(  &*  &,  &§  &´  &¶  &¸  &º  '-  ':  '<  '>  '@  'µ  'Â  'Ä  'Æ  'È  (7  (D  (F  (H  (J  (¿  (Ì  (Î  (Ğ  (Ò  )E  )R  )T  )V  )X  )É  )Ö  )Ø  )Ú  )Ü  *T  *a  *c  *e  *g  *Û  *è  *ê  *ì  *î  +i  +v  +x  +z  +|  +ô  ,  ,  ,  ,  ,  ,  ,  ,’  ,”  -  -  -  -  -!  -  -ª  -¿  -Á  -Ã  -Å  -Ç  -É  -Ë  -Í  -Ï  -Ñ  -Ó  -è  -ê  -ì  -î  -ğ  -ò  -ô  -ö  -ø  -ú  -ü  -ş  .  .:  .^  .€  .¤  .Ê  .î  /  /,  /I  /R  /U  /W  /Y  /b  /k  /m  /o  /q  /s  /u  /w  /x  /y  /†  /‹  /  /  /”  /–  /˜  /š  /½  /Ú  /ç  /î  /ğ  /ò  /ô  /û  /ı  /ÿ  0  0  0,  0^  0  0ˆ  0•  0¨  0ª  0³  0º  0¿  0È  0Õ  0è  0ê  0ó  0ü  1	  1  1  1   1"  1$  1)  1+  1-  1/  1;  1J  1S  1T  1V  1Y  1b  1o  1t  1v  1x  1}  1  1  1ƒ  1‰  1˜  1¡  1·  1¾  1Ë  1à  1â  1ä  1æ  1è  1ê  1ì  1î  1ğ  1ò  1ô  2	  2  2  2  2  2  2  2  2  2  2  2  2<  2[  2  2¡  2Å  2ë  3  3.  3M  3j  3s  3v  3x  3z  3ƒ  3Œ  3  3  3’  3”  3–  3£  3¨  3ª  3¬  3±  3³  3µ  3·  3Ú  3÷  4  4  4  4  4  4  4  4  4  4   4I  4{  4œ  4¥  4²  4Å  4Ç  4Ğ  4İ  4ğ  4ò  4ÿ  5  5  5  5  5  5  5  5"  5%  5.  5;  5@  5B  5D  5I  5K  5M  5O  5^  5k  5€  5‚  5„  5†  5ˆ  5Š  5Œ  5  5  5’  5”  5©  5«  5­  5¯  5±  5³  5µ  5·  5¹  5»  5½  5¿  5Ü  5û  6  6A  6e  6‹  6¯  6Î  6í  7
+  7  7  7  7  7#  7,  7.  70  72  74  76  78  7:  7<  7I  7N  7P  7R  7W  7Y  7[  7]  7€  7  7ª  7±  7³  7µ  7·  7¾  7À  7Â  7Ä  7Æ  7ø  8  8B  8K  8X  8k  8m  8v  8ƒ  8–  8˜  8¥  8ª  8¬  8®  8³  8µ  8·  8¹  8È  8Ñ  8Ò  8Ô  8×  8à  8â  8ï  8ô  8ö  8ø  8ı  8ÿ  9  9  9  9  94  96  98  9:  9<  9>  9@  9B  9D  9F  9H  9]  9_  9a  9c  9e  9g  9i  9k  9m  9o  9q  9s  9  9¯  9Ó  9õ  :  :?  :c  :‚  :¡  :¾  :Ç  :Ê  :Ì  :Î  :×  :à  :â  :ä  :æ  :è  :ê  :ì  :î  :û  ;   ;  ;  ;	  ;  ;  ;  ;2  ;O  ;\  ;c  ;e  ;g  ;i  ;p  ;r  ;t  ;v  ;x  ;ª  ;Ë  ;ô  ;ı  <
+  <  <  <(  <5  <H  <J  <W  <\  <^  <`  <e  <g  <i  <k  <z  <}  <Š  <  <‘  <“  <˜  <š  <œ  <  <­  <º  <Ï  <Ñ  <Ó  <Õ  <×  <Ù  <Û  <İ  <à  <ã  <æ  <û  <ş  =   =  =  =  =	  =  =  =  =  =  =1  =P  =t  =–  =º  =à  >  >#  >B  >_  >h  >k  >n  >p  >y  >‚  >…  >ˆ  >‹  >  >  >’  >”  >¡  >¦  >©  >¬  >±  >´  >·  >¹  >Ö  >ù  ?  ?  ?  ?  ?  ?  ?  ?  ?+  ?.  ?;  ?B  ?E  ?H  ?K  ?R  ?U  ?W  ?Z  ?\  ?…  ?¦  ?Ø  ?á  ?î  @  @  @  @  @,  @.  @;  @@  @B  @E  @J  @L  @O  @Q  @`  @m  @‚  @…  @ˆ  @‹  @  @‘  @”  @—  @š  @  @   @µ  @¸  @º  @¼  @¾  @Á  @Ä  @Ç  @É  @Ì  @Î  @Ğ  @í  A  A0  AR  Av  Aœ  AÀ  Aß  Aş  B  B$  B'  B*  B,  B5  B>  BA  BD  BG  BJ  BL  BN  B[  B`  Bc  Bf  Bk  Bn  Bq  Bs  B–  B³  BÀ  BÇ  BÊ  BÍ  BĞ  B×  BÙ  BÜ  Bß  Bá  C  C+  C]  Cf  Cs  C†  Cˆ  C‘  C  C±  C³  CÀ  CÅ  CÇ  CÊ  CÏ  CÑ  CÔ  CÖ  Cå  Cè  Cñ  Có  D   D  D  D
+  D  D  D  D  D%  D2  DG  DJ  DM  DP  DS  DV  DY  D\  D_  Db  De  Dz  D}  D  D  Dƒ  D†  Dˆ  DŠ  DŒ  D  D‘  D“  D°  DÏ  Dó  E  E9  E_  Eƒ  E¢  EÁ  EŞ  Eç  Eê  Eí  Eï  Eø  F  F  F  F  F	  F  F  F  F   F#  F(  F+  F.  F0  FS  Fp  F}  F„  F‡  FŠ  F  F”  F—  Fš  Fœ  F  FÇ  Fù  G  G#  G0  GC  GE  GN  G[  Gn  Gp  G}  G‚  G…  G‡  GŒ  G  G‘  G“  G¢  G¤  G±  G¶  G¸  G»  GÀ  GÂ  GÅ  GÇ  GÖ  Gã  Gø  Gû  Gş  H  H  H  H
+  H  H  H  H  H+  H.  H0  H2  H4  H7  H9  H;  H=  H@  HB  HD  Ha  H€  H¤  HÆ  Hê  I  I4  IS  Ir  I  I˜  I›  I  I   I©  I²  Iµ  I¸  I»  I¾  IÀ  IÂ  IÏ  IÔ  I×  IÚ  Iß  Iâ  Iå  Iç  J  J'  J4  J9  J<  J>  JC  JF  JH  JJ  JY  J\  Ji  Jp  Js  Jv  Jy  J€  Jƒ  J†  Jˆ  JŠ  J¼  Jå  K  K  K  K/  K1  K:  KG  KZ  K\  Ki  Kn  Kp  Ks  Kx  Kz  K}  K  K  K›  K°  K³  K¶  K¹  K¼  K¿  KÂ  KÅ  KÈ  KË  KÎ  Kã  Kæ  Kè  Kê  Kì  Kï  Kò  Kõ  K÷  Kú  Kü  Kş  L  L:  L^  L€  L¤  LÊ  Lî  M  M,  MI  MR  MU  MX  MZ  Mc  Ml  Mo  Mr  Mu  Mx  Mz  M|  M~  M‹  M  M“  M–  M›  M  M¡  M£  MÆ  Mã  Mğ  M÷  Mú  Mı  N   N  N
+  N  N  N  N:  N[  N  N–  N£  N¶  N¸  NÁ  NÎ  Ná  Nã  Nğ  Nõ  N÷  Nú  Nÿ  O  O  O  O  O  O!  O#  O0  O5  O7  O:  O?  OA  OD  OF  OU  Ob  Ow  Oz  O}  O€  Oƒ  O†  O‰  OŒ  O  O’  O•  Oª  O­  O¯  O±  O³  O¶  O¸  Oº  O¼  O¿  OÁ  OÃ  Oà  Oÿ  P#  PE  Pi  P  P³  PÒ  Pñ  Q  Q  Q  Q  Q  Q(  Q1  Q4  Q7  Q:  Q=  Q?  QA  QN  QS  QV  QY  Q^  Qa  Qd  Qf  Qƒ  Q¦  Q³  Q¸  Q»  Q½  QÂ  QÅ  QÇ  QÉ  QØ  QÛ  Qè  Qï  Qò  Qõ  Qø  Qÿ  R  R  R  R	  R2  Rd  R…  R  R›  R®  R°  R¹  RÆ  RÙ  RÛ  Rè  Rí  Rï  Rò  R÷  Rù  Rü  Rş  S  S  S/  S2  S5  S8  S;  S>  SA  SD  SG  SJ  SM  Sb  Se  Sg  Si  Sk  Sn  Sq  St  Sv  Sy  S{  S}  Sš  S¹  Sİ  Sÿ  T#  TI  Tm  TŒ  T«  TÈ  TÑ  TÔ  T×  TÙ  Tâ  Të  Tí  Tï  Tñ  Tó  Tõ  U  U  U
+  U  U  U  U  U  U=  UZ  Ug  Un  Uq  Ut  Uw  U~  U  U„  U†  Uˆ  U±  Uã  V  V  V  V-  V/  V8  VE  VX  VZ  Vg  Vl  Vo  Vq  Vv  Vy  V{  V}  VŒ  V  V˜  Vš  V§  V¬  V®  V±  V¶  V¸  V»  V½  VÌ  VÙ  Vî  Vñ  Vô  V÷  Vú  Vı  W   W  W  W	  W  W!  W$  W&  W(  W*  W-  W/  W1  W3  W6  W8  W:  WW  Wv  Wš  W¼  Wà  X  X*  XI  Xh  X…  X  X‘  X”  X–  XŸ  X¨  X«  X®  X±  X´  X¶  X¸  XÅ  XÊ  XÍ  XĞ  XÕ  XØ  XÛ  Xİ  Xú  Y  Y*  Y/  Y1  Y4  Y9  Y;  Y>  Y@  YO  YR  Y_  Yf  Yi  Yl  Yo  Yv  Yx  Y{  Y~  Y€  Y¡  YÓ  Yü  Z  Z  Z%  Z'  Z0  Z=  ZP  ZR  Z_  Zd  Zf  Zi  Zn  Zp  Zs  Zu  Z„  Z‘  Z¦  Z©  Z¬  Z¯  Z²  Zµ  Z¸  Z»  Z¾  ZÁ  ZÄ  ZÙ  ZÜ  ZŞ  Zà  Zâ  Zå  Zç  Zé  Zë  Zî  Zğ  Zò  [  [.  [R  [t  [˜  [¾  [â  \  \   \=  \F  \I  \L  \N  \W  \`  \c  \f  \i  \l  \n  \{  \€  \ƒ  \†  \‹  \  \‘  \“  \¶  \Ó  \à  \ç  \ê  \í  \ğ  \÷  \ù  \ü  \ÿ  ]  ]"  ]T  ]}  ]†  ]“  ]¦  ]¨  ]±  ]¾  ]Ñ  ]Ó  ]à  ]å  ]ç  ]ê  ]ï  ]ñ  ]ô  ]ö  ^  ^  ^  ^  ^  ^  ^$  ^&  ^)  ^+  ^:  ^G  ^\  ^_  ^b  ^e  ^h  ^k  ^n  ^q  ^t  ^w  ^z  ^  ^’  ^”  ^–  ^˜  ^›  ^  ^¡  ^£  ^¦  ^¨  ^ª  ^Ç  ^æ  _
+  _,  _P  _v  _š  _¹  _Ø  _õ  _ş  `  `  `  `  `  `  `  `!  `$  `&  `(  `*  `7  `<  `?  `B  `G  `J  `M  `O  `r  `  `œ  `£  `¦  `©  `¬  `³  `µ  `¸  `»  `½  `Ş  a  a9  aB  aO  ab  ad  am  az  a  a  aœ  a¡  a£  a¦  a«  a­  a°  a²  aÁ  aÄ  aÍ  aÏ  aÜ  aá  aã  aæ  aë  aí  ağ  aò  b  b  b#  b&  b)  b,  b/  b2  b5  b8  b;  b>  bA  bV  bY  b[  b]  b_  bb  bd  bg  bi  bl  bn  bp  b  b¬  bĞ  bò  c  c<  c`  c  c  c»  cÄ  cÇ  cÊ  cÌ  cÕ  cŞ  cá  cä  cç  cê  cì  cî  cğ  cı  d  d  d  d  d  d  d  d2  dU  db  dg  dj  dl  dq  dt  dv  dx  d‡  dŠ  d—  d  d¡  d¤  d§  d®  d±  d´  d¶  d¸  dá  e  e4  e=  eJ  e]  e_  eh  eu  eˆ  eŠ  eŒ  e™  e  e   e£  e¨  eª  e­  e¯  e¾  eË  eà  eã  eæ  eé  eì  eï  eò  eõ  eø  eû  eş  f  f  f  f  f  f  f!  f#  f%  f(  f*  f,  fI  fh  fŒ  f®  fÒ  fø  g  g;  gZ  gw  g€  gƒ  g†  gˆ  g‘  gš  gœ  g  g   g¢  g¤  g±  g¶  g¹  g¼  gÁ  gÄ  gÇ  gÉ  gì  h	  h  h  h   h#  h&  h-  h0  h3  h5  h7  h`  h’  h³  h¼  hÉ  hÜ  hŞ  hç  hô  i  i	  i  i  i  i   i%  i'  i*  i,  i;  i=  iJ  iO  iQ  iT  iY  i[  i^  i`  io  i|  i‘  i”  i—  iš  i  i   i£  i¦  i©  i¬  i¯  iÄ  iÇ  iÉ  iË  iÍ  iĞ  iÓ  iÖ  iØ  iÛ  iİ  iß  iü  j  j?  ja  j…  j«  jÏ  jî  k  k*  k3  k6  k9  k;  kD  kM  kP  kS  kV  kY  k[  k]  k_  kl  kq  kt  kw  k|  k  k‚  k„  k§  kÄ  kÑ  kØ  kÛ  kŞ  ká  kè  kë  kî  kğ  kò  l$  lM  ln  lw  l„  l—  l™  l¢  l¯  lÂ  lÄ  lÑ  lÖ  lØ  lÛ  là  lâ  lå  lç  lö  lù  m  m  m  m  m  m  m  m  m+  m8  mM  mP  mS  mV  mY  m\  m_  mb  me  mh  mk  m€  mƒ  m…  m‡  m‰  mŒ  m  m  m’  m•  m—  m™  m¶  mÕ  mù  n  n?  ne  n‰  n¨  nÇ  nä  ní  nğ  nó  nõ  nş  o  o
+  o  o  o  o  o  o$  o)  o,  o/  o4  o7  o:  o<  o_  o|  o‰  o  o“  o–  o™  o   o£  o¦  o¨  oª  oÓ  p  p&  p/  p<  pO  pQ  pZ  pg  pz  p|  p‰  p  p  p“  p˜  pš  p  pŸ  p®  p±  p¾  pÃ  pÅ  pÈ  pÍ  pÏ  pÒ  pÔ  pã  pğ  q  q  q  q  q  q  q  q  q  q   q#  q8  q;  q=  q?  qA  qD  qF  qH  qJ  qM  qO  qQ  qn  q  q±  qÓ  q÷  r  rA  r`  r  rœ  r¥  r¨  r«  r­  r¶  r¿  rÂ  rÄ  rÇ  rÉ  rË  rØ  rİ  rà  rã  rè  rë  rî  rğ  s  s0  s=  sD  sG  sJ  sM  sT  sW  sZ  s\  s^  s  s¹  sÚ  sã  sğ  t  t  t  t  t.  t0  t=  tB  tE  tG  tL  tO  tQ  tS  tb  te  tr  tw  ty  t|  t  tƒ  t†  tˆ  t—  t¤  t¹  t¼  t¿  tÂ  tÅ  tÈ  tË  tÎ  tÑ  tÔ  t×  tì  tï  tñ  tó  tõ  tø  tú  tü  tş  u  u  u  u"  uA  ue  u‡  u«  uÑ  uõ  v  v3  vP  vY  v\  v_  va  vj  vs  vv  vy  v|  v  v  v  v“  v–  v™  v  v¡  v¤  v¦  vÃ  væ  vó  vø  vú  vı  w  w  w  w	  w  w  w(  w/  w2  w5  w8  w?  wB  wD  wG  wI  wr  w“  wÅ  wÎ  wÛ  wî  wğ  wù  x  x  x  x(  x-  x/  x2  x7  x9  x<  x>  xM  xZ  xo  xr  xu  xx  x{  x~  x  x„  x‡  xŠ  x  x¢  x¥  x§  x©  x«  x®  x±  x´  x¶  x¹  x»  x½  xÚ  xù  y  y?  yc  y‰  y­  yÌ  yë  z  z  z  z  z  z"  z+  z.  z0  z3  z5  z7  z9  zF  zK  zN  zQ  zV  zY  z\  z^  z{  z  z«  z°  z²  zµ  zº  z¼  z¿  zÁ  zĞ  zÓ  zà  zç  zê  zí  zğ  z÷  zù  zü  zÿ  {  {"  {K  {}  {†  {“  {¦  {¨  {±  {¾  {Ñ  {Ó  {Õ  {â  {ç  {é  {ì  {ñ  {ó  {ö  {ø  |  |  |)  |,  |/  |2  |5  |8  |;  |>  |A  |D  |G  |\  |_  |a  |c  |e  |h  |j  |l  |n  |q  |s  |u  |’  |±  |Õ  |÷  }  }A  }e  }„  }£  }À  }É  }Ì  }Ï  }Ñ  }Ú  }ã  }æ  }é  }ì  }ï  }ñ  }ó  ~   ~  ~  ~  ~  ~  ~  ~  ~5  ~X  ~e  ~j  ~m  ~o  ~t  ~w  ~y  ~{  ~Š  ~  ~š  ~¡  ~¤  ~§  ~ª  ~±  ~´  ~¶  ~¹  ~»  ~ä    7  @  M  `  b  k  x  ‹    š  Ÿ  ¡  ¤  ©  «  ®  °  ¿  Ì  á  ä  ç  ê  í  ğ  ó  ö  ù  ü  ÿ  €  €  €  €  €  €   €"  €$  €&  €)  €+  €-  €J  €i  €  €¯  €Ó  €ù    <  [  x    „  ‡  ‰  ’  ›    ¡  ¤  §  ©  «  ¸  ½  À  Ã  È  Ë  Î  Ğ  í  ‚  ‚  ‚"  ‚$  ‚'  ‚,  ‚.  ‚1  ‚3  ‚B  ‚E  ‚R  ‚Y  ‚\  ‚_  ‚b  ‚i  ‚l  ‚n  ‚q  ‚s  ‚¥  ‚Æ  ‚ï  ‚ø  ƒ  ƒ  ƒ  ƒ#  ƒ0  ƒC  ƒE  ƒR  ƒW  ƒY  ƒ\  ƒa  ƒc  ƒf  ƒh  ƒw  ƒ„  ƒ™  ƒœ  ƒŸ  ƒ¢  ƒ¥  ƒ¨  ƒ«  ƒ®  ƒ±  ƒ´  ƒ·  ƒÌ  ƒÏ  ƒÑ  ƒÓ  ƒÕ  ƒØ  ƒÚ  ƒÜ  ƒŞ  ƒá  ƒã  ƒå  „  „!  „E  „g  „‹  „±  „Õ  „ô  …  …0  …9  …<  …?  …A  …J  …S  …V  …Y  …\  …_  …a  …c  …p  …u  …x  …{  …€  …ƒ  …†  …ˆ  …¥  …È  …Õ  …Ú  …İ  …ß  …ä  …ç  …é  …ë  …ú  …ı  †
+  †  †  †  †  †!  †$  †&  †)  †+  †T  †u  †§  †°  †½  †Ğ  †Ò  †Û  †è  †û  †ı  ‡
+  ‡  ‡  ‡  ‡  ‡  ‡  ‡   ‡/  ‡<  ‡Q  ‡T  ‡W  ‡Z  ‡]  ‡`  ‡c  ‡f  ‡i  ‡l  ‡o  ‡„  ‡‡  ‡‰  ‡‹  ‡  ‡  ‡’  ‡”  ‡–  ‡™  ‡›  ‡  ‡º  ‡Ù  ‡ı  ˆ  ˆC  ˆi  ˆ  ˆ¬  ˆË  ˆè  ˆñ  ˆô  ˆ÷  ˆù  ‰  ‰  ‰  ‰  ‰  ‰  ‰  ‰"  ‰'  ‰*  ‰-  ‰2  ‰5  ‰8  ‰:  ‰W  ‰z  ‰‡  ‰Œ  ‰  ‰‘  ‰–  ‰™  ‰›  ‰  ‰¬  ‰¯  ‰¼  ‰Ã  ‰Æ  ‰É  ‰Ì  ‰Ó  ‰Ö  ‰Ø  ‰Û  ‰İ  Š  Š'  ŠY  Šb  Šo  Š‚  Š„  Š  Šš  Š­  Š¯  Š¼  ŠÁ  ŠÃ  ŠÆ  ŠË  ŠÍ  ŠĞ  ŠÒ  Šá  Šî  ‹  ‹  ‹	  ‹  ‹  ‹  ‹  ‹  ‹  ‹  ‹!  ‹6  ‹9  ‹;  ‹=  ‹?  ‹B  ‹E  ‹H  ‹J  ‹M  ‹O  ‹Q  ‹n  ‹  ‹±  ‹Ó  ‹÷  Œ  ŒA  Œ`  Œ  Œœ  Œ¥  Œ¨  Œ«  Œ­  Œ¶  Œ¿  ŒÂ  ŒÅ  ŒÈ  ŒË  ŒÍ  ŒÏ  ŒÜ  Œá  Œä  Œç  Œì  Œï  Œò  Œô    4  A  H  K  N  Q  X  [  ]  `  b  ‹  ¬  Ş  ç  ô    	      2  4  A  F  I  K  P  S  U  W  f  i  r    „  †  ‰      “  •  ¤  ±  Æ  É  Ì  Ï  Ò  Õ  Ø  Û  Ş  á  ä  ù  ü  ş                     1  P  t  –  º  à    #  B  _  h  k  n  p  y  ‚  …  ˆ  ‹      ’  ”  ¡  ¦  ©  ¬  ±  ´  ·  ¹  Ö  ù  ‘  ‘  ‘  ‘  ‘  ‘  ‘  ‘  ‘+  ‘.  ‘;  ‘B  ‘E  ‘H  ‘K  ‘R  ‘U  ‘X  ‘Z  ‘\  ‘…  ‘·  ‘Ø  ‘á  ‘î  ’  ’  ’  ’  ’,  ’.  ’7  ’D  ’I  ’K  ’N  ’S  ’U  ’X  ’Z  ’i  ’v  ’‹  ’  ’‘  ’”  ’—  ’š  ’  ’   ’£  ’¦  ’©  ’¾  ’Á  ’Ã  ’Å  ’Ç  ’Ê  ’Ì  ’Î  ’Ğ  ’Ó  ’Õ  ’×  ’ô  “  “7  “Y  “}  “£  “Ç  “æ  ”  ”"  ”+  ”.  ”1  ”3  ”<  ”E  ”H  ”K  ”N  ”Q  ”S  ”U  ”W  ”d  ”i  ”l  ”o  ”t  ”w  ”z  ”|  ”Ÿ  ”¼  ”É  ”Ğ  ”Ó  ”Ö  ”Ù  ”à  ”ã  ”æ  ”è  ”ê  •  •E  •f  •o  •|  •  •‘  •š  •§  •º  •¼  •É  •Î  •Ğ  •Ó  •Ø  •Ú  •İ  •ß  •î  •ñ  •ş  –  –  –  –  –  –  –  –#  –0  –E  –H  –K  –N  –Q  –T  –W  –Z  –]  –`  –c  –x  –{  –}  –  –  –„  –‡  –‰  –‹  –  –  –’  –¯  –Î  –ò  —  —8  —^  —‚  —¡  —À  —İ  —æ  —é  —ì  —î  —÷  ˜   ˜  ˜  ˜	  ˜  ˜  ˜  ˜  ˜"  ˜%  ˜(  ˜-  ˜0  ˜3  ˜5  ˜R  ˜u  ˜‚  ˜‡  ˜‰  ˜Œ  ˜‘  ˜“  ˜–  ˜˜  ˜§  ˜ª  ˜·  ˜¾  ˜Á  ˜Ä  ˜Ç  ˜Î  ˜Ñ  ˜Ô  ˜Ö  ˜Ø  ™  ™3  ™T  ™]  ™j  ™}  ™  ™ˆ  ™•  ™¨  ™ª  ™³  ™À  ™Å  ™Ç  ™Ê  ™Ï  ™Ñ  ™Ô  ™Ö  ™å  ™ò  š  š
+  š  š  š  š  š  š  š  š"  š%  š:  š=  š?  šA  šC  šF  šH  šJ  šL  šO  šQ  šS  šp  š  š³  šÕ  šù  ›  ›C  ›b  ›  ›  ›§  ›ª  ›­  ›¯  ›¸  ›Á  ›Ä  ›Ç  ›Ê  ›Í  ›Ï  ›Ñ  ›Ş  ›ã  ›æ  ›é  ›î  ›ñ  ›ô  ›ö  œ  œ6  œC  œH  œJ  œM  œR  œT  œW  œY  œh  œk  œx  œ  œ‚  œ…  œˆ  œ  œ’  œ”  œ—  œ™  œË  œì      +  >  @  I  V  i  k  x  }    ‚  ‡  ‰  Œ      ª  ¿  Â  Å  È  Ë  Î  Ñ  Ô  ×  Ú  İ  ò  õ  ÷  ù  û  ş           
+    )  H  l    ²  Ø  ü  Ÿ  Ÿ:  ŸW  Ÿ`  Ÿc  Ÿf  Ÿh  Ÿq  Ÿz  Ÿ}  Ÿ€  Ÿƒ  Ÿ†  Ÿˆ  ŸŠ  Ÿ—  Ÿœ  ŸŸ  Ÿ¢  Ÿ§  Ÿª  Ÿ­  Ÿ¯  ŸÌ  Ÿï  Ÿü                        !   $   1   8   ;   >   A   H   K   M   P   R   {   œ   Î   ×   ä   ÷   ù  ¡  ¡  ¡"  ¡$  ¡1  ¡6  ¡8  ¡;  ¡@  ¡B  ¡E  ¡G  ¡V  ¡c  ¡x  ¡{  ¡~  ¡  ¡„  ¡‡  ¡Š  ¡  ¡  ¡“  ¡–  ¡«  ¡®  ¡°  ¡²  ¡´  ¡·  ¡¹  ¡»  ¡½  ¡À  ¡Â  ¡Ä  ¡á  ¢   ¢$  ¢F  ¢j  ¢  ¢´  ¢Ó  ¢ò  £  £  £  £  £   £)  £2  £5  £8  £;  £>  £@  £B  £O  £T  £W  £Z  £_  £b  £e  £g  £Š  £§  £´  £»  £¾  £Á  £Ä  £Ë  £Î  £Ğ  £Ó  £Õ  £ş  ¤  ¤Q  ¤Z  ¤g  ¤z  ¤|  ¤…  ¤’  ¤¥  ¤§  ¤´  ¤¹  ¤¼  ¤¾  ¤Ã  ¤Æ  ¤È  ¤Ê  ¤Ù  ¤Ü  ¤é  ¤î  ¤ğ  ¤ó  ¤ø  ¤ú  ¤ı  ¤ÿ  ¥  ¥  ¥0  ¥3  ¥6  ¥9  ¥<  ¥?  ¥B  ¥E  ¥H  ¥K  ¥N  ¥c  ¥f  ¥h  ¥j  ¥l  ¥o  ¥q  ¥s  ¥u  ¥x  ¥z  ¥|  ¥™  ¥¸  ¥Ü  ¥ş  ¦"  ¦H  ¦l  ¦‹  ¦ª  ¦Ç  ¦Ğ  ¦Ó  ¦Ö  ¦Ø  ¦á  ¦ê  ¦í  ¦ğ  ¦ó  ¦ö  ¦ø  ¦ú  §  §  §  §  §  §  §  §  §<  §_  §l  §q  §t  §v  §{  §~  §€  §‚  §‘  §”  §¡  §¨  §«  §®  §±  §¸  §»  §¾  §À  §Â  §ë  ¨  ¨>  ¨G  ¨T  ¨g  ¨i  ¨r  ¨  ¨’  ¨”  ¨¡  ¨¦  ¨¨  ¨«  ¨°  ¨²  ¨µ  ¨·  ¨Æ  ¨Ó  ¨è  ¨ë  ¨î  ¨ñ  ¨ô  ¨÷  ¨ú  ¨ı  ©   ©  ©  ©  ©  ©   ©"  ©$  ©'  ©)  ©+  ©-  ©0  ©2  ©4  ©Q  ©p  ©”  ©¶  ©Ú  ª   ª$  ªC  ªb  ª  ªˆ  ª‹  ª  ª  ª™  ª¢  ª¤  ª¦  ª¨  ªª  ª¬  ª¹  ª¾  ªÁ  ªÄ  ªÉ  ªÌ  ªÏ  ªÑ  ªî  «  «  «#  «&  «(  «-  «0  «2  «4  «C  «F  «S  «Z  «]  «`  «c  «j  «m  «p  «r  «t  «  «Ï  «ğ  «ù  ¬  ¬  ¬  ¬$  ¬1  ¬D  ¬F  ¬S  ¬X  ¬Z  ¬]  ¬b  ¬d  ¬g  ¬i  ¬x  ¬…  ¬š  ¬  ¬   ¬£  ¬¦  ¬©  ¬¬  ¬¯  ¬²  ¬µ  ¬¸  ¬Í  ¬Ğ  ¬Ò  ¬Ô  ¬Ö  ¬Ù  ¬Û  ¬Ş  ¬à  ¬ã  ¬å  ¬ç  ­  ­#  ­G  ­i  ­  ­³  ­×  ­ö  ®  ®2  ®;  ®>  ®A  ®C  ®L  ®U  ®X  ®[  ®^  ®a  ®c  ®e  ®r  ®w  ®z  ®}  ®‚  ®…  ®ˆ  ®Š  ®­  ®Ê  ®×  ®Ş  ®á  ®ä  ®ç  ®î  ®ğ  ®ó  ®ö  ®ø  ¯  ¯B  ¯t  ¯}  ¯Š  ¯  ¯Ÿ  ¯¨  ¯µ  ¯È  ¯Ê  ¯×  ¯Ü  ¯Ş  ¯á  ¯æ  ¯è  ¯ë  ¯í  ¯ü  ¯ÿ  °  °  °  °  °  °  °  °"  °$  °3  °@  °U  °X  °[  °^  °a  °d  °g  °j  °m  °p  °s  °ˆ  °‹  °  °  °‘  °”  °—  °š  °œ  °Ÿ  °¡  °£  °À  °ß  ±  ±%  ±I  ±o  ±“  ±²  ±Ñ  ±î  ±÷  ±ú  ±ı  ±ÿ  ²  ²  ²  ²  ²  ²  ²  ²!  ².  ²3  ²6  ²9  ²>  ²A  ²D  ²F  ²i  ²†  ²“  ²š  ²  ²   ²£  ²ª  ²­  ²¯  ²²  ²´  ²æ  ³  ³0  ³9  ³F  ³Y  ³[  ³d  ³q  ³„  ³†  ³“  ³˜  ³š  ³  ³¢  ³¤  ³§  ³©  ³¸  ³»  ³Ä  ³Ñ  ³Ö  ³Ø  ³Û  ³à  ³â  ³å  ³ç  ³ö  ´  ´  ´  ´  ´!  ´$  ´'  ´*  ´-  ´0  ´3  ´6  ´K  ´N  ´P  ´R  ´T  ´W  ´Y  ´[  ´]  ´`  ´b  ´d  ´  ´   ´Ä  ´æ  µ
+  µ0  µT  µs  µ’  µ¯  µ¸  µ»  µ¾  µÀ  µÉ  µÒ  µÔ  µÖ  µØ  µÚ  µÜ  µé  µî  µñ  µô  µù  µü  µÿ  ¶  ¶  ¶A  ¶N  ¶S  ¶U  ¶X  ¶]  ¶_  ¶b  ¶d  ¶s  ¶v  ¶ƒ  ¶Š  ¶  ¶  ¶“  ¶š  ¶  ¶   ¶¢  ¶¤  ¶Í  ¶ÿ  ·   ·)  ·6  ·I  ·K  ·T  ·a  ·t  ·v  ·ƒ  ·ˆ  ·Š  ·  ·’  ·”  ·—  ·™  ·¨  ·µ  ·Ê  ·Í  ·Ğ  ·Ó  ·Ö  ·Ù  ·Ü  ·ß  ·â  ·å  ·è  ·ı  ¸   ¸  ¸  ¸  ¸	  ¸  ¸  ¸  ¸  ¸  ¸  ¸3  ¸R  ¸v  ¸˜  ¸¼  ¸â  ¹  ¹%  ¹D  ¹a  ¹j  ¹m  ¹p  ¹r  ¹{  ¹„  ¹‡  ¹Š  ¹  ¹  ¹’  ¹”  ¹¡  ¹¦  ¹©  ¹¬  ¹±  ¹´  ¹·  ¹¹  ¹Ö  ¹ù  º  º  º  º  º  º  º  º  º+  º.  º;  ºB  ºE  ºH  ºK  ºR  ºT  ºW  ºZ  º\  º}  º¦  ºØ  ºá  ºî  »  »  »  »  »,  ».  »;  »@  »B  »E  »J  »L  »O  »Q  »`  »m  »‚  »…  »ˆ  »‹  »  »‘  »”  »—  »š  »  »   »µ  »¸  »º  »¼  »¾  »Á  »Ã  »Å  »Ç  »Ê  »Ì  »Î  »ë  ¼
+  ¼.  ¼P  ¼t  ¼š  ¼¾  ¼İ  ¼ü  ½  ½"  ½%  ½(  ½*  ½3  ½<  ½?  ½B  ½E  ½H  ½J  ½W  ½\  ½_  ½b  ½g  ½j  ½m  ½o  ½’  ½¯  ½¼  ½Ã  ½Æ  ½É  ½Ì  ½Ó  ½Ö  ½Ø  ½Û  ½İ  ¾  ¾0  ¾Y  ¾b  ¾o  ¾‚  ¾„  ¾  ¾š  ¾­  ¾¯  ¾¼  ¾Á  ¾Ã  ¾Æ  ¾Ë  ¾Í  ¾Ğ  ¾Ò  ¾á  ¾ä  ¾ñ  ¾ö  ¾ø  ¾û  ¿   ¿  ¿  ¿  ¿  ¿#  ¿8  ¿;  ¿>  ¿A  ¿D  ¿G  ¿J  ¿M  ¿P  ¿S  ¿V  ¿k  ¿n  ¿p  ¿r  ¿t  ¿w  ¿y  ¿{  ¿}  ¿€  ¿‚  ¿„  ¿¡  ¿À  ¿ä  À  À*  ÀP  Àt  À“  À²  ÀÏ  ÀØ  ÀÛ  ÀŞ  Àà  Àé  Àò  Àô  Àö  Àø  Àú  Àü  Á	  Á  Á  Á  Á  Á  Á  Á!  ÁD  Áa  Án  Áu  Áx  Á{  Á~  Á…  Áˆ  Á‹  Á  Á  Á¸  Áê  Â  Â  Â!  Â4  Â6  Â?  ÂL  Â_  Âa  Ân  Âs  Âv  Âx  Â}  Â€  Â‚  Â„  Â“  Â   Â¥  Â§  Âª  Â¯  Â±  Â´  Â¶  ÂÅ  ÂÒ  Âç  Âê  Âí  Âğ  Âó  Âö  Âù  Âü  Âÿ  Ã  Ã  Ã  Ã  Ã  Ã!  Ã#  Ã&  Ã)  Ã,  Ã.  Ã1  Ã3  Ã5  ÃR  Ãq  Ã•  Ã·  ÃÛ  Ä  Ä%  ÄD  Äc  Ä€  Ä‰  ÄŒ  Ä  Ä‘  Äš  Ä£  Ä¦  Ä©  Ä¬  Ä¯  Ä±  Ä¾  ÄÃ  ÄÆ  ÄÉ  ÄÎ  ÄÑ  ÄÔ  ÄÖ  Äó  Å  Å#  Å(  Å*  Å-  Å2  Å4  Å7  Å9  ÅH  ÅK  ÅX  Å_  Åb  Åe  Åh  Åo  År  Åu  Åw  Åy  Å«  ÅÔ  Åõ  Åş  Æ  Æ  Æ   Æ)  Æ6  ÆI  ÆK  ÆX  Æ]  Æ_  Æb  Æg  Æi  Æl  Æn  Æ}  ÆŠ  ÆŸ  Æ¢  Æ¥  Æ¨  Æ«  Æ®  Æ±  Æ´  Æ·  Æº  Æ½  ÆÒ  ÆÕ  Æ×  ÆÙ  ÆÛ  ÆŞ  Æà  Æâ  Æä  Æç  Æé  Æë  Ç  Ç'  ÇK  Çm  Ç‘  Ç·  ÇÛ  Çú  È  È6  È?  ÈB  ÈE  ÈG  ÈP  ÈY  È\  È_  Èb  Èe  Èg  Èt  Èy  È|  È  È„  È‡  ÈŠ  ÈŒ  È©  ÈÌ  ÈÙ  ÈŞ  Èà  Èã  Èè  Èê  Èí  Èï  Èş  É  É  É  É  É  É  É%  É'  É*  É-  É/  ÉP  É‚  É«  É´  ÉÁ  ÉÔ  ÉÖ  Éß  Éì  Éÿ  Ê  Ê  Ê  Ê  Ê  Ê  Ê  Ê"  Ê$  Ê3  Ê@  ÊU  ÊX  Ê[  Ê^  Êa  Êd  Êg  Êj  Êm  Êp  Ês  Êˆ  Ê‹  Ê  Ê  Ê‘  Ê”  Ê–  Ê˜  Êš  Ê  ÊŸ  Ê¡  Ê¾  Êİ  Ë  Ë#  ËG  Ëm  Ë‘  Ë°  ËÏ  Ëì  Ëõ  Ëø  Ëû  Ëı  Ì  Ì  Ì  Ì  Ì  Ì  Ì  Ì&  Ì+  Ì.  Ì1  Ì6  Ì9  Ì<  Ì>  Ì[  Ì~  Ì‹  Ì  Ì“  Ì•  Ìš  Ì  ÌŸ  Ì¡  Ì°  Ì³  ÌÀ  ÌÇ  ÌÊ  ÌÍ  ÌĞ  Ì×  ÌÚ  Ìİ  Ìß  Ìá  Í
+  Í<  Í]  Íf  Ís  Í†  Íˆ  Í‘  Í  Í±  Í³  ÍÀ  ÍÅ  ÍÇ  ÍÊ  ÍÏ  ÍÑ  ÍÔ  ÍÖ  Íå  Íò  Î  Î
+  Î  Î  Î  Î  Î  Î  Î  Î"  Î%  Î:  Î=  Î?  ÎA  ÎC  ÎF  ÎH  ÎJ  ÎL  ÎO  ÎQ  ÎS  Îp  Î  Î³  ÎÕ  Îù  Ï  ÏC  Ïb  Ï  Ï  Ï§  Ïª  Ï­  Ï¯  Ï¸  ÏÁ  ÏÄ  ÏÇ  ÏÊ  ÏÍ  ÏÏ  ÏÑ  ÏÓ  Ïà  Ïå  Ïè  Ïë  Ïğ  Ïó  Ïö  Ïø  Ğ  Ğ8  ĞE  ĞL  ĞO  ĞR  ĞU  Ğ\  Ğ_  Ğb  Ğd  Ğf  Ğ  ĞÁ  Ğâ  Ğë  Ğø  Ñ  Ñ  Ñ  Ñ#  Ñ6  Ñ8  ÑE  ÑJ  ÑM  ÑO  ÑT  ÑW  ÑY  Ñ[  Ñj  Ñm  Ñz  Ñ  Ñ  Ñ„  Ñ‰  Ñ‹  Ñ  Ñ  ÑŸ  Ñ¬  ÑÁ  ÑÄ  ÑÇ  ÑÊ  ÑÍ  ÑĞ  ÑÓ  ÑÖ  ÑÙ  ÑÜ  Ñß  Ñô  Ñ÷  Ñù  Ñû  Ñı  Ò   Ò  Ò  Ò  Ò	  Ò  Ò  Ò*  ÒI  Òm  Ò  Ò³  ÒÙ  Òı  Ó  Ó;  ÓX  Óa  Ód  Óg  Ói  Ór  Ó{  Ó~  Ó  Ó„  Ó‡  Ó‰  Ó–  Ó›  Ó  Ó¡  Ó¦  Ó©  Ó¬  Ó®  ÓË  Óî  Óû  Ô   Ô  Ô  Ô
+  Ô  Ô  Ô  Ô   Ô#  Ô0  Ô7  Ô:  Ô=  Ô@  ÔG  ÔJ  ÔM  ÔO  ÔQ  Ôz  Ô¬  ÔÍ  ÔÖ  Ôã  Ôö  Ôø  Õ  Õ  Õ!  Õ#  Õ0  Õ5  Õ7  Õ:  Õ?  ÕA  ÕD  ÕF  ÕU  Õb  Õe  Õh  Õk  Õn  Õp  Õ}  Õ  Õ  Õ„  ÕÛ  Õè  Õñ  Õô  Õ÷  Õú  Õı  Ö  Ö	  Ö  Ö  Ö  Ö  ÖD  Ös  Ö¢  ÖË  Öå  Öú  ×  ×  ×	  ×  ×  ×&  ×0  ×<  ×?  ×B  ×E  ×H  ×Ÿ  ×¨  ×µ  ×º  ×½  ×À  ×Å  ×È  ×Ë  ×Í  ×Ô  ×Û  ×ğ  ×ü  Ø  Ø%  Ø,  ØL  Øb  Øo  Øp  Øq  Øs  Ø€  Ø…  Øˆ  Ø‹  Ø  Ø“  Ø–  Ø˜  Ø¥  Ø§  Ø©  Ø¬  Øá  Øî  Øğ  Øò  Øõ  Ù*  Ù7  Ù:  Ù=  Ù@  ÙC  ÙE  Ùa  Ùj  Ùm  Ùp  Ùr  Ù‡  Ùš  Ù¤  Ù§  Ù©  Ùª  Ù­  Ù°  Ù½  ÙÑ  Ùã  Ùæ  Ùé  Ùò  Ùú  Ùı  Ú   Ú	  Ú  Ú  Ú%  Ú.  Ú:  Ú?  ÚK  ÚT  Úm  Út  Ú  Ú£  Ú°  Ú³  Ú¶  Ú¹  Ú¼  Ú¾  ÚÚ  Úã  Úæ  Úé  Úë  Û   Û  Û  Û  Û	  Û  Û  Û  Û  Û(  Û+  Û.  Û;  Û>  Û@  ÛC  ÛF  ÛH  ÛU  Ûf  Ûi  Ûl  Ûo  Ûr  Ûu  Ûx  Û{  Û~  Û  Û’  Û•  Û˜  Û›  Û  Û¡  Û¤  Û§  Û©  ÛÃ  ÛÏ  Ûâ  Ûı  Ü  Ü  Ü0  Ü>  ÜG  ÜJ  ÜM  ÜP  Ü•  Ü  Ü«  Ü²  Ü¸  ÜÁ  ÜÄ  ÜÇ  ÜÊ  Üç  İ  İ  İ  İ  İ  İ!  İ.  İ1  İ4  İ7  İ:  İ<  İN  İW  İZ  İ]  İ`  İb  İk  İp  İ{  İˆ  İ‰  İŠ  İŒ  İ™  İœ  İŸ  İ¢  İ¥  İ§  İµ  İÁ  İÆ  İÉ  İÒ  İÙ  İŞ  İç  İê  İì  İî  İû  İş  Ş   Ş  Ş  Ş  Ş  Ş  Ş  Ş  Ş"  Ş1  Ş8  ŞE  ŞL  ŞO  ŞR  ŞU  Ş\  Ş_  Şb  Şe  Şg  Şˆ  ŞÀ  Şé  Şö  Şù  Şü  Şÿ  ß  ß  ß  ß  ß!  ß*  ß-  ß6  ß=  ßB  ßO  ßR  ßU  ßX  ß[  ß]  ßi  ßr  ß|  ß  ß½  ßÆ  ßØ  ßß  ßè  ßõ  ßø  ßû  ßş  à  à  àA  àJ  àS  àV  àc  àx  à{  à~  à  à„  à‡  àŠ  à  à  à“  à–  à«  à­  à°  à²  à´  à·  àº  à½  àÀ  àÃ  àÆ  àÈ  àÓ  àê  á  á  á/  áF  á[  áe  áz  á’  á¤  á¶  á÷  áş  â  â  â&  â/  â0  â3  â@  âI  âL  âO  âR  âU  â^  âa  âd  âg  âj  âl  â…  â   â»  âî  âô  âı  âÿ  ã  ã  ã  ã  ã  ã  ã(  ã/  ã2  ã5  ã8  ã?  ãB  ãE  ãH  ãJ  ãs  ã¡  ãÍ  ãÏ  ãÜ  ãã  ãæ  ãé  ãì  ãó  ãö  ãù  ãü  ãş  ä  ä  è  è   è-  è:  è=  è@  èC  èF  èI  èL  èY  è\  è_  èb  èe  èh  èk  èm  è’  è·  èá  é  é  é  é   éC  éP  éa  éd  ég  éj  ém  ép  és  év  éy  éŠ  éŒ  é  é‘  é”  é–  é™  é›  é  éŸ  é·  éÆ  éö  ê7  ê`  ê‚  ê  ê¹  êÛ  êè  êû  êş  ë  ë  ë  ë
+  ë  ë  ë  ë  ë)  ë+  ë.  ë1  ë4  ë7  ë:  ë=  ë?  ëB  ëD  ëW  ëj  ë~  ë‘  ë¥  ë²  ëÈ  ëÛ  ëé  ëö  ì  ì  ì	  ì  ì  ì  ì  ì"  ì%  ì(  ì+  ì.  ì1  ì4  ì6  ìY  ìw  ìœ  ì°  ìÂ  ìè  ìõ  ìş  í  í  í  í
+  í  í  í  í  í  í!  í8  íL  íe  í€  í  í  í  í‘  í¬  í¹  í¼  í¿  íÂ  íÅ  íÇ  íâ  íë  î  î  î  õ7  õ@  õi  õp  õ™  õş  ö  ö  ö  ö  ö  ö  ö!  ö#  ö?  öM  öZ  öa  öd  ög  öj  öq  öt  öw  öz  ö|  ö›  ö°  ö¼  öÔ  öå  öï  öú  ÷  ÷  ÷
+  ÷  ÷  ÷  ÷"  ÷+  ÷.  ÷1  ÷:  ÷=  ÷E  ÷N  ÷f  ÷k  ÷ƒ  ÷›  ÷¤  ÷Å  ÷Ê  ÷ë  ÷ğ  ÷ñ  ÷ş  ø  ø
+  ø  ø  ø  ø  ø  ø"  ø%  ø(  ø*  øA  øU  øn  ø‰  ø–  ø—  ø˜  øš  øµ  øÂ  øÅ  øÈ  øË  øÎ  øĞ  øë  øô  ù  ù  ù  ùÌ  ùï  ùü  ú  ú  ú  ú  ú  ú  ú  ú   ú#  ú&  ú(  úM  úu  ú˜  ú»  úá  úî  ú÷  úú  úı  û   û  û  û  û  û  û  û  û1  ûE  û^  ûy  û†  û‰  ûŒ  û  û’  û”  û¯  ş!  ş<  şI  şL  şO  şR  şU  şW  şr  ş{  ş˜  ş›  ş                7  @  ]  `  c › ¤ ± ¶ ¹ ¼ Á Ã Æ È ò     # , 9 < ? B D F d q v y |  ƒ … ‡ Ÿ Á Î å è ë î ñ ô ÷ ú ı        " % ( + . 1 4 7 : = ? b  ¡ ¬ Ï ç  ! 0 F i v ‰ Œ — ™ ¦ § ¨ ª ³ ¶ ¹ ¼ É Ö Ù Ü ß â å è õ ø û ş      ' = K W w y † ‹  ‘ – ™ ›  ² Å Î Ù Ü ß â å è ê  ' K ] {  › ¹ ¼ ¿ Â Å È Ë Í Ğ é ü  # 6 R U X [ ^ a c •  « ® ± ´ · º ½ ¿ Ì × İ à â å ô ı  ! @ M P R U Z g j l o t  „ † ‰     ¢ ¥ ± ¾ Á Ã Æ Ò ß â å ç 	T 	] 	s 	x 	 	— 	¢ 	¥ 	¨ 	ø 
+ 
+ 
+ 
+  
+2 
+; 
+f 
+k 
+– 
+¬ 
+Ü 
+é 
+ş    
+       1 4 6 8 : = @ C E H J L i ˆ ¬ Î ò  < [ z —   £ ¦ ¨ ± º ½ À Ã Æ È Ê × Ü ß â ç ê í ï  / < A C F K M P R a n u x { ~ … ˆ ‹   ¸ ê   ! 4 6 ? L _ a n s u x }  ‚ „ “ ¢ « Â Ç Ş ÿ         . 1 4 7 : = ? H O R U X Z g j m p ‚  ’ ” — ¤ § © ¬ ¸ Å È Ë Í * F S d g j m p s v y |   “ – ™ œ Ÿ ¢ ¥ § Á Í à û 	  . < E H K N “ œ Ÿ ¢ ¥ Â â ï ğ ñ ó     	     ) , / 2 = J K L N [ |  ‚ … ˆ ‹   “ ¬ ¯ ² µ ¸ » ½ Æ Ó Ö Ù Ü ß â å ç ô ÷ ù ü   " $ ' 1 > A C F S V X [ h k m p } € ‚ … ‘  ¡ ¤ ¦  * ? B E H K N Q T W Z ] r u w y { ~  „ † ‰ ‹  ª É í  3 Y } œ » Ø á ä ç é ò û ş    	    ! & ) , . K n { € ‚ … Š Œ  ‘   ­ ´ · º ½ Ä Ç Ê Ì Î ÷ ) J S ` s u ~ ‹    ­ ² ´ · ¼ ¾ Á Ã Ò î       ! # & ? B E H K N P Y f i l o r u x z ‡ Š Œ  ¢ ¯ ² µ ¸ ¿ Ì Ï Ñ Ô á ä æ é ö ù û ş      , / 2 4 ¥ ² Ç Ê Í Ğ Ó Ö Ù Ü ß â å ú ı ÿ     
+     0 O s • ¹ ß  " A ^ g j m o x  „ † ‰ ‹  š Ÿ ¢ ¥ ª ­ ° ² Ï ò ÿ   	     $ 1 8 ; > A H K N P R { ­ Î × ä ÷ ù   " $ 1 6 8 ; @ B E G V a ‚ … ˆ ‹  ‘ ” – ™ ² µ ¸ » ¾ Á Ã Ì Õ Ø Û Ş á ã ğ ó ö ù     " & 3 6 8 ; H K M P \ i l o q Ô á ö ù ü ÿ        ) , . 0 2 5 8 ; = @ B D a € ¤ Æ ê    4  S  r    ˜  ›       ©  ²  µ  ¸  »  ¾  À  Í  Ò  Õ  Ø  İ  à  ã  å ! !% !2 !9 !< !? !B !I !L !O !Q !S !| !® !Ï !Ø !å !ø !ú " " "# "% "2 "7 "9 "< "A "C "F "H "W "d "i "k "n "s "u "x "z "‰ " "— "š " "  "© "Ä "Ç "Ê "ë "î "ñ "ô "÷ "ú "ı "ÿ # # # #! #$ #' #* #, #5 #B #E #H #K #N #Q #T #V #c #f #h #k #x #{ #} #€ # # #’ #• #¢ #¥ #§ #ª #· #º #¼ #¿ #Ì #Ï #Ñ #Ô #à #í #ğ #ó #õ $ $ $ $ $  $# $& $) $, $/ $2 $5 $J $M $O $Q $S $V $Y $\ $^ $a $c $e $‚ $¡ $Å $ç % %1 %U %t %“ %° %¹ %¼ %¿ %Á %Ê %Ó %Ö %Ù %Ü %ß %á %î %ó %ö %ù %ş & & & &# &F &S &X &Z &] &b &d &g &i &x &… &Œ & &’ &• &œ &Ÿ &¢ &¤ &¦ &Ï ' '" '+ '8 'K 'M 'V 'c 'v 'x '… 'Š 'Œ ' '” '– '™ '› 'ª 'µ '¾ 'Ö 'Û 'ó ( ( (! ($ (' (* (- (/ (8 (E (H (K (N (Q (T (W (Y (f (i (k (n ({ (~ (€ (ƒ ( (“ (• (˜ (¥ (¨ (ª (­ (º (½ (¿ (Â (Ï (Ò (Ô (× (ã (ğ (ó (ö (ø ) ) ) ) ) ) )' )0 )5 )8 ); )> )K )R )U )X )[ )b )e )g )j )l )z )‡ )š )¤ )­ )º )Á )Ä )Ç )Ê )Ñ )Ô )Ö )Ù )Û )í )ö )ø * * * * * * *# *& *) *+ *. *0 *9 *C *N *f *s *| * *‚ *… *ˆ *‘ *“ *• *— *™ *› *¹ *Ö *ù + + +0 +3 +6 +9 +< +? +B +E +H +Y +[ +] +_ +a +c +e +g +i +k +™ +É +ö ,% ,P ,€ ,² ,á ,î ,ñ ,ô ,÷ ,ú ,ü - - - -! -$ -' -4 -; -> -A -D -K -N -P -S -U -^ -g -t -{ -~ - -„ -‹ - - -“ -• -Ÿ -¨            '             -½
 
 /== TheMealsApp.xcodeproj/project.xcworkspace/xcuserdata/gilangramadhan.xcuserdatad/UserInterfaceState.xcuserstate
 bplist00Ô        
